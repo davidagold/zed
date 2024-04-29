@@ -46,6 +46,7 @@ members = [
     "crates/inline_completion_button",
     "crates/install_cli",
     "crates/journal",
+    "crates/jupyter",
     "crates/language",
     "crates/language_selector",
     "crates/language_tools",
@@ -136,7 +137,7 @@ members = [
     "extensions/vue",
     "extensions/zig",
 
-    "tooling/xtask",
+    "tooling/xtask", "crates/jupyter",
 ]
 default-members = ["crates/zed"]
 resolver = "2"
@@ -189,6 +190,7 @@ install_cli = { path = "crates/install_cli" }
 image_viewer = { path = "crates/image_viewer" }
 inline_completion_button = { path = "crates/inline_completion_button" }
 journal = { path = "crates/journal" }
+jupyter = { path = "crates/jupyter" }
 language = { path = "crates/language" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
