@@ -4,6 +4,14 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+jupyter-server = "*"
+jupyter-client = "*"
+nbclient = "*"
+ipykernel = "*"
+ruff = "*"
+pydantic = "*"
+pendulum = "*"
+rich = "*"
 
 [dev-packages]
 
