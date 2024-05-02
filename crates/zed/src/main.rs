@@ -273,6 +273,7 @@ fn init_ui(args: Args) {
         language::init(cx);
         editor::init(cx);
         image_viewer::init(cx);
+        jupyter::init(cx);
         diagnostics::init(cx);
         copilot::init(
             copilot_language_server_id,
