@@ -5591,43 +5591,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jupyter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-compat",
- "collections",
- "command_palette",
- "command_palette_hooks",
- "editor",
- "gpui",
- "indoc",
- "itertools 0.11.0",
- "language",
- "log",
- "lsp",
- "parking_lot",
- "project",
- "release_channel",
- "rope",
- "runtimelib",
- "schemars",
- "search",
- "serde",
- "serde_derive",
- "serde_json",
- "settings",
- "sum_tree",
- "text",
- "tokio",
- "ui",
- "util",
- "workspace",
- "worktree",
- "zed_actions",
-]
-
-[[package]]
 name = "jwt"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6547,6 +6510,43 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "notebook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compat",
+ "collections",
+ "command_palette",
+ "command_palette_hooks",
+ "editor",
+ "gpui",
+ "indoc",
+ "itertools 0.11.0",
+ "language",
+ "log",
+ "lsp",
+ "parking_lot",
+ "project",
+ "release_channel",
+ "rope",
+ "runtimelib",
+ "schemars",
+ "search",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "settings",
+ "sum_tree",
+ "text",
+ "tokio",
+ "ui",
+ "util",
+ "workspace",
+ "worktree",
+ "zed_actions",
 ]
 
 [[package]]
@@ -13088,7 +13088,6 @@ dependencies = [
  "install_cli",
  "isahc",
  "journal",
- "jupyter",
  "language",
  "language_selector",
  "language_tools",
@@ -13100,6 +13099,7 @@ dependencies = [
  "mimalloc",
  "nix",
  "node_runtime",
+ "notebook",
  "notifications",
  "outline",
  "parking_lot",

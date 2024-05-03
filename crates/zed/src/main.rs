@@ -356,6 +356,8 @@ fn main() {
         project::Project::init(&client, cx);
         client::init(&client, cx);
         language::init(cx);
+        editor::init(cx);
+
         let telemetry = client.telemetry();
         telemetry.start(installation_id.clone(), session_id, cx);
         telemetry.report_app_event(
