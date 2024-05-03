@@ -44,7 +44,6 @@ zed_actions.workspace = true
 [dev-dependencies]
 command_palette.workspace = true
 editor = { workspace = true, features = ["test-support"] }
-futures.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 release_channel.workspace = true
 indoc.workspace = true
