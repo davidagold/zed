@@ -1,24 +1,25 @@
 //! Jupyter support for Zed.
 use collections::HashMap;
-use editor::Editor;
+use editor::{Editor, ExcerptRange, MultiBuffer};
 use gpui::{
-    impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, WeakView,
+    impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model,
+    ModelContext, View, WeakView,
 };
 use itertools::Itertools;
-use language::{self, Buffer};
-use project::{self, ProjectPath};
-use rope::Bytes;
+use language::{self, Buffer, Capability};
+use project::{self, Project, ProjectPath};
 use runtimelib::media::MimeType;
-use serde::de::{self, DeserializeOwned, DeserializeSeed, Visitor};
+use serde::de::{self, DeserializeOwned, DeserializeSeed, Error, Visitor};
 use serde_derive::Deserialize;
-use std::{io::Read, ops::RangeFull, sync::Arc};
+use std::{io::Read, num::NonZeroU64, ops::Range, sync::Arc};
 use sum_tree::{self, SumTree, Summary};
-use ui::{Render, ViewContext};
+use ui::{Render, ViewContext, VisualContext};
 use worktree::File;
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#top-level-structure
 #[derive(Default)]
 struct Notebook {
+    file: Option<Arc<dyn language::File>>,
     metadata: Option<HashMap<String, String>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: usize,
@@ -26,8 +27,9 @@ struct Notebook {
     cells: Cells,
 }
 
-struct NotebookBuilder<'de> {
-    cx: &'de mut AppContext,
+struct NotebookBuilder<'a, 'b: 'a> {
+    cx: &'a mut ModelContext<'b, Notebook>,
+    file: Option<Arc<dyn language::File>>,
     metadata: Option<HashMap<String, String>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: Option<usize>,
@@ -35,10 +37,14 @@ struct NotebookBuilder<'de> {
     cells: Cells,
 }
 
-impl<'de> NotebookBuilder<'de> {
-    fn new(cx: &'de mut AppContext) -> NotebookBuilder<'de> {
+impl<'a, 'b: 'a> NotebookBuilder<'a, 'b> {
+    fn new(
+        file: Option<Arc<dyn language::File>>,
+        cx: &'a mut ModelContext<'b, Notebook>,
+    ) -> NotebookBuilder<'a, 'b> {
         NotebookBuilder {
             cx,
+            file,
             metadata: None,
             nbformat: None,
             nbformat_minor: None,
@@ -48,6 +54,7 @@ impl<'de> NotebookBuilder<'de> {
 
     fn build(self) -> Notebook {
         Notebook {
+            file: self.file,
             metadata: self.metadata,
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
@@ -60,8 +67,12 @@ fn parse_value<T: DeserializeOwned, E: serde::de::Error>(val: serde_json::Value)
     serde_json::from_value::<T>(val).map_err(|err| E::custom(err.to_string()))
 }
 
-impl<'de> Visitor<'de> for &'de mut NotebookBuilder<'de> {
-    type Value = ();
+impl<'a, 'b, 'de> Visitor<'de> for NotebookBuilder<'a, 'b>
+where
+    'b: 'a,
+    'a: 'de,
+{
+    type Value = NotebookBuilder<'a, 'b>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -82,26 +93,33 @@ impl<'de> Visitor<'de> for &'de mut NotebookBuilder<'de> {
                 "cells" => {
                     let items: Vec<serde_json::Map<String, serde_json::Value>> = parse_value(val)?;
                     for (idx, item) in items.into_iter().enumerate() {
-                        let cell_builder = CellBuilder::new(&mut self.cx, idx, item);
+                        let id: CellId = NonZeroU64::new(idx as u64)
+                            .ok_or_else(|| A::Error::custom("Nope"))?
+                            .into();
+                        let cell_builder = CellBuilder::new(&mut self.cx, id, item);
                         let cell = cell_builder.build();
                         self.cells.0.push(cell, &());
                     }
                 }
+                _ => {}
             }
         }
-        Ok(())
+        Ok(self)
     }
 }
 
-impl<'de> DeserializeSeed<'de> for NotebookBuilder<'de> {
-    type Value = NotebookBuilder<'de>;
+impl<'a, 'b, 'de> DeserializeSeed<'de> for NotebookBuilder<'a, 'b>
+where
+    'b: 'a,
+    'a: 'de,
+{
+    type Value = NotebookBuilder<'a, 'b>;
 
-    fn deserialize<D>(mut self, deserializer: D) -> Result<Self::Value, D::Error>
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: de::Deserializer<'de>,
     {
-        deserializer.deserialize_map(&mut self)?;
-        Ok(self)
+        deserializer.deserialize_map(self)
     }
 }
 
@@ -113,7 +131,7 @@ struct Cells(SumTree<Cell>);
 struct Cell {
     // The following should be owned by the underlying Buffer
     // TODO: Make an ID type?
-    idx: usize,
+    idx: CellId,
     cell_id: Option<String>,
     cell_type: CellType,
     metadata: HashMap<String, serde_json::Value>,
@@ -144,7 +162,7 @@ enum SerializedCellSource {
 // containing these data.
 struct CellBuilder<'de> {
     cx: &'de mut AppContext,
-    idx: usize,
+    idx: CellId,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
     metadata: Option<HashMap<String, serde_json::Value>>,
@@ -155,7 +173,7 @@ struct CellBuilder<'de> {
 impl<'de> CellBuilder<'de> {
     fn new(
         cx: &mut AppContext,
-        idx: usize,
+        idx: CellId,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> CellBuilder {
         let mut this = CellBuilder {
@@ -177,10 +195,7 @@ impl<'de> CellBuilder<'de> {
                 "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                 "source" => {
                     let text: String = serde_json::from_value(val).unwrap_or_default();
-                    let source_buf = this.cx.new_model::<Buffer>(|model_cx| {
-                        // let cell: Cell = serde_json::from_value(item).map_err(A::Error::custom)?;
-                        Buffer::local(text, model_cx)
-                    });
+                    let source_buf = this.cx.new_model(|model_cx| Buffer::local(text, model_cx));
                     this.source.replace(source_buf);
                 }
                 "execution_count" => {
@@ -247,6 +262,16 @@ impl sum_tree::Item for Cell {
             cell_type: self.cell_type.clone(),
             // text_summary: source.base_text().summary(),
         }
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
+pub struct CellId(NonZeroU64);
+
+impl From<NonZeroU64> for CellId {
+    fn from(id: NonZeroU64) -> Self {
+        CellId(id)
     }
 }
 
@@ -328,17 +353,59 @@ enum JupyterServerEvent {}
 
 // #[derive(Default)]
 struct NotebookEditor {
-    file: Option<Arc<dyn language::File>>,
     active_cell: Option<WeakView<Cell>>,
     notebook: Model<Notebook>,
-    // focus_handle: FocusHandle,
+    // editors: HashMap<CellId, View<Editor>>,
+    editor: View<Editor>,
+    focus_handle: FocusHandle,
 }
 
-impl project::Item for NotebookEditor {
+impl NotebookEditor {
+    fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
+        let cells = notebook
+            .read(cx)
+            .cells
+            .0
+            .iter()
+            .map(|cell| {
+                let range = ExcerptRange {
+                    context: Range {
+                        start: 0 as usize,
+                        end: cell.source.read(cx).row_count() as usize,
+                    },
+                    primary: None,
+                };
+                (cell.source.clone(), range)
+            })
+            .collect_vec();
+
+        let multi = cx.new_model(|model_cx| {
+            let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
+            for (source, range) in cells {
+                multi.push_excerpts(source, [range].to_vec(), model_cx);
+            }
+            multi
+        });
+        let editor = cx.new_view(|cx| {
+            let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
+            editor.set_vertical_scroll_margin(5, cx);
+            editor
+        });
+
+        NotebookEditor {
+            active_cell: None,
+            notebook,
+            editor,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl project::Item for Notebook {
     fn try_open(
-        project: &gpui::Model<project::Project>,
+        project_handle: &gpui::Model<project::Project>,
         path: &project::ProjectPath,
-        cx: &mut gpui::AppContext,
+        app_cx: &mut gpui::AppContext,
     ) -> Option<gpui::Task<gpui::Result<gpui::Model<Self>>>>
     where
         Self: Sized,
@@ -347,38 +414,28 @@ impl project::Item for NotebookEditor {
             return None;
         }
 
-        let task = cx.spawn(|mut cx_task| async move {
-            let buf = project
-                .update(&mut cx_task, |project, model_cx| {
-                    project.open_buffer(path.clone(), model_cx)
-                })?
-                .await?;
+        let project = project_handle.downgrade();
+        let open_buffer_task =
+            project.update(app_cx, |project, cx| project.open_buffer(path.clone(), cx));
 
-            let notebook = cx.new_model(move |cx_model| {
-                let bytes = buf.read_with(cx_model, |buf, cx_model| {
-                    let mut bytes = Vec::<u8>::with_capacity(buf.len());
-                    buf.bytes_in_range(0..buf.len()).read_to_end(&mut bytes);
-                    bytes
-                });
+        let task = app_cx.spawn(|mut cx| async move {
+            let buffer_handle = open_buffer_task?.await?;
 
-                let deserializer = serde_json::Deserializer::from_slice(bytes.as_slice());
+            cx.new_model(move |cx_model| {
+                let buffer = buffer_handle.read(cx_model);
+                let mut bytes = Vec::<u8>::with_capacity(buffer.len());
+                let _ = buffer
+                    .bytes_in_range(0..buffer.len())
+                    .read_to_end(&mut bytes);
 
-                NotebookBuilder::new(cx)
+                let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+
+                NotebookBuilder::new(buffer.file().map(|file| file.clone()), cx_model)
                     .deserialize(&mut deserializer)
                     .map(|builder| builder.build())
                     .unwrap_or_default()
-            });
-
-            Ok(cx.new_model(move |cx_model| {
-                NotebookEditor {
-                    file: None,
-                    active_cell: None,
-                    notebook,
-                    // focus_handle:
-                }
-            }))
+            })
         });
-
         Some(task)
     }
 
@@ -441,20 +498,18 @@ impl Render for NotebookEditor {
 }
 
 impl workspace::item::ProjectItem for NotebookEditor {
-    type Item = NotebookEditor;
+    type Item = Notebook;
 
-    // fn for_project_item(
-    //     project: gpui::Model<project::Project>,
-    //     item: gpui::Model<Self::Item>,
-    //     cx: &mut ui::prelude::ViewContext<Self>,
-    // ) -> Self
-    // where
-    //     Self: Sized,
-    // {
-    //     Self {
-    //         focus_handle: cx.focus_handle(),
-    //     }
-    // }
+    fn for_project_item(
+        project: gpui::Model<project::Project>,
+        notebook: gpui::Model<Notebook>,
+        cx: &mut ui::prelude::ViewContext<Self>,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        NotebookEditor::new(project, notebook, cx)
+    }
 }
 
 pub fn init(cx: &mut AppContext) {
