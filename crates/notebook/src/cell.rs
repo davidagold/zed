@@ -1,14 +1,14 @@
-use std::num::NonZeroU64;
+use std::{fmt::Debug, num::NonZeroU64};
 
 use collections::HashMap;
 use gpui::{AppContext, Context, FocusHandle, Model};
 use language::Buffer;
 use runtimelib::media::MimeType;
-use serde::Deserialize;
+use serde::{de::Visitor, Deserialize};
 use sum_tree::{SumTree, Summary};
 use ui::{Render, ViewContext};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Cell {
     // The following should be owned by the underlying Buffer
     // TODO: Make an ID type?
@@ -20,27 +20,8 @@ pub struct Cell {
     execution_count: Option<usize>,
 }
 
-// https://nbformat.readthedocs.io/en/latest/format_description.html#cell-types
-#[derive(Clone, Debug, Default, Deserialize)]
-pub enum CellType {
-    Raw,
-    // https://nbformat.readthedocs.io/en/latest/format_description.html#markdown-cells
-    Markdown,
-    // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cells
-    #[default]
-    Code,
-}
-
-// TODO: Appropriate deserialize of `source` from `CellSource` (`String`/`Vec<String>`) values
-#[derive(Deserialize)]
-pub enum SerializedCellSource {
-    String(String),
-    MultiLineString(Vec<String>),
-}
-
-// We need a replica and `BufferId` to create a `TextBuffer`, and the easiest way
-// to pass these to `deserialize` is to implement `DeserializeSeed` for a struct
-// containing these data.
+// Including the `cx: AppContext` in the builder, which is the direct target of deserialization,
+// allows us to pass the `cx` along as we deserialize via `DeserializeSeed::deserialize`.
 pub struct CellBuilder<'de> {
     cx: &'de mut AppContext,
     idx: CellId,
@@ -49,6 +30,12 @@ pub struct CellBuilder<'de> {
     metadata: Option<HashMap<String, serde_json::Value>>,
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
+}
+
+impl<'de> Debug for CellBuilder<'de> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`cell_id`: {:#?}", self.cell_id)
+    }
 }
 
 impl<'de> CellBuilder<'de> {
@@ -68,21 +55,42 @@ impl<'de> CellBuilder<'de> {
         };
 
         for (key, val) in map {
-            match key.as_str() {
-                "cell_id" => this.cell_id = val.as_str().map(|s| s.to_string()),
-                "cell_type" => {
-                    this.cell_type = serde_json::from_value(val).unwrap_or_default();
-                }
-                "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
-                "source" => {
-                    let text: String = serde_json::from_value(val).unwrap_or_default();
-                    let source_buf = this.cx.new_model(|model_cx| Buffer::local(text, model_cx));
-                    this.source.replace(source_buf);
-                }
-                "execution_count" => {
-                    this.execution_count = serde_json::from_value(val).unwrap_or_default()
-                }
-                _ => {}
+            let result_parse_entry = (|| -> anyhow::Result<()> {
+                match key.as_str() {
+                    "cell_id" => this.cell_id = val.as_str().map(|s| s.to_string()),
+                    "cell_type" => {
+                        this.cell_type = serde_json::from_value(val).unwrap_or_default();
+                    }
+                    "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
+                    "source" => {
+                        let source: CellSource = serde_json::from_value(val).unwrap_or_default();
+                        let source_text = match source {
+                            CellSource::String(src) => src,
+                            CellSource::MultiLineString(src_lines) => {
+                                src_lines.join("\n").to_string()
+                            }
+                        };
+                        let source_buf = this
+                            .cx
+                            .new_model(|model_cx| Buffer::local(source_text, model_cx));
+                        this.source.replace(source_buf);
+                    }
+                    "execution_count" => {
+                        this.execution_count = serde_json::from_value(val).unwrap_or_default()
+                    }
+                    _ => {}
+                };
+
+                Ok(())
+            })();
+
+            match result_parse_entry {
+                Ok(()) => log::info!("Successfully parsed notebook entry with key '{:#?}'", key),
+                Err(err) => log::error!(
+                    "Failed to parse notebook entry with key '{:#?}': {:#?}",
+                    key,
+                    err
+                ),
             }
         }
 
@@ -98,6 +106,64 @@ impl<'de> CellBuilder<'de> {
             source: self.source.unwrap(),
             execution_count: self.execution_count,
         }
+    }
+}
+
+// https://nbformat.readthedocs.io/en/latest/format_description.html#cell-types
+#[derive(Clone, Debug, Default)]
+pub enum CellType {
+    Raw,
+    // https://nbformat.readthedocs.io/en/latest/format_description.html#markdown-cells
+    Markdown,
+    // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cells
+    #[default]
+    Code,
+}
+
+struct CellTypeVisitor();
+
+impl<'de> Visitor<'de> for CellTypeVisitor {
+    type Value = CellType;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(formatter, "One of 'raw', 'markdown', or 'code'")
+    }
+
+    fn visit_str<E>(self, cell_type: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match cell_type {
+            "raw" => Ok(CellType::Raw),
+            "markdown" => Ok(CellType::Markdown),
+            "code" => Ok(CellType::Code),
+            _ => Err(E::custom(format!(
+                "Unexpected cell type '{:#?}'",
+                cell_type
+            ))),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CellType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(CellTypeVisitor())
+    }
+}
+
+// TODO: Appropriate deserialize of `source` from `CellSource` (`String`/`Vec<String>`) values
+#[derive(Debug, Deserialize)]
+pub enum CellSource {
+    String(String),
+    MultiLineString(Vec<String>),
+}
+
+impl Default for CellSource {
+    fn default() -> CellSource {
+        CellSource::String("".into())
     }
 }
 
