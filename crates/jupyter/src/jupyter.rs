@@ -1,9 +1,11 @@
 //! Jupyter support for Zed.
 use collections::HashMap;
-use editor::{Editor, ExcerptRange, MultiBuffer};
+use editor::{
+    items::entry_label_color, Editor, EditorEvent, ExcerptRange, MultiBuffer, MAX_TAB_TITLE_LEN,
+};
 use gpui::{
     impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model,
-    ModelContext, View, WeakView,
+    ModelContext, ParentElement, View, WeakView,
 };
 use itertools::Itertools;
 use language::{self, Buffer, Capability};
@@ -11,9 +13,14 @@ use project::{self, Project, ProjectPath};
 use runtimelib::media::MimeType;
 use serde::de::{self, DeserializeOwned, DeserializeSeed, Error, Visitor};
 use serde_derive::Deserialize;
-use std::{io::Read, num::NonZeroU64, ops::Range, sync::Arc};
+use std::{any::Any, io::Read, num::NonZeroU64, ops::Range, sync::Arc};
 use sum_tree::{self, SumTree, Summary};
-use ui::{Render, ViewContext, VisualContext};
+use ui::{
+    div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
+    SharedString, Styled, ViewContext, VisualContext,
+};
+use util::paths::PathExt;
+use workspace::item::{Item, ItemEvent, ItemHandle};
 use worktree::File;
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#top-level-structure
@@ -410,7 +417,7 @@ impl project::Item for Notebook {
     where
         Self: Sized,
     {
-        if path.path.extension().unwrap() != "ipynb" {
+        if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
             return None;
         }
 
@@ -454,36 +461,72 @@ impl project::Item for Notebook {
 const NOTEBOOK_KIND: &'static str = "NotebookEditor";
 
 impl workspace::item::Item for NotebookEditor {
-    type Event = ();
+    type Event = EditorEvent;
 
-    // fn tab_content(
-    //     &self,
-    //     _params: workspace::item::TabContentParams,
-    //     _cx: &ui::prelude::WindowContext,
-    // ) -> gpui::AnyElement {
-    // }
+    fn to_item_events(event: &Self::Event, f: impl FnMut(ItemEvent)) {
+        Editor::to_item_events(event, f)
+    }
 
-    // fn tab_tooltip_text(&self, cx: &AppContext) -> Option<SharedString> {
-    //     let file_path = self
-    //         .buffer()
-    //         .read(cx)
-    //         .as_singleton()?
-    //         .read(cx)
-    //         .file()
-    //         .and_then(|f| f.as_local())?
-    //         .abs_path(cx);
+    fn deactivated(&mut self, cx: &mut ViewContext<Self>) {
+        self.editor.update(cx, |editor, cx| editor.deactivated(cx));
+    }
 
-    //     let file_path = file_path.compact().to_string_lossy().to_string();
+    fn navigate(&mut self, data: Box<dyn Any>, cx: &mut ViewContext<Self>) -> bool {
+        self.editor
+            .update(cx, |editor, cx| editor.navigate(data, cx))
+    }
 
-    //     Some(file_path.into())
-    // }
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut workspace::Workspace,
+        cx: &mut ViewContext<Self>,
+    ) {
+        self.editor
+            .update(cx, |editor, cx| editor.added_to_workspace(workspace, cx))
+    }
+
+    fn tab_content(
+        &self,
+        params: workspace::item::TabContentParams,
+        cx: &ui::prelude::WindowContext,
+    ) -> gpui::AnyElement {
+        let title = (&self.notebook).read(cx).file.as_ref().and_then(|f| {
+            let path = f.as_local()?.abs_path(cx);
+            Some(util::truncate_and_trailoff(
+                path.to_str()?,
+                MAX_TAB_TITLE_LEN,
+            ))
+        });
+
+        h_flex()
+            .gap_2()
+            .when_some(title, |this, title| {
+                this.child(
+                    Label::new(title)
+                        .color(entry_label_color(params.selected))
+                        .italic(params.preview),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn tab_tooltip_text(&self, cx: &AppContext) -> Option<SharedString> {
+        let path = (&self.notebook)
+            .read(cx)
+            .file
+            .as_ref()
+            .and_then(|f| f.as_local())?
+            .abs_path(cx);
+
+        Some(path.compact().to_string_lossy().to_string().into())
+    }
 
     fn serialized_item_kind() -> Option<&'static str> {
         Some(NOTEBOOK_KIND)
     }
 }
 
-impl EventEmitter<()> for NotebookEditor {}
+impl EventEmitter<EditorEvent> for NotebookEditor {}
 
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
@@ -493,7 +536,12 @@ impl FocusableView for NotebookEditor {
 
 impl Render for NotebookEditor {
     fn render(&mut self, cx: &mut ui::prelude::ViewContext<Self>) -> impl ui::prelude::IntoElement {
-        gpui::Empty
+        let child = self.editor.clone();
+
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .child(child)
     }
 }
 
