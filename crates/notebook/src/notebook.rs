@@ -7,6 +7,7 @@ use crate::common::parse_value;
 use cell::CellBuilder;
 use collections::HashMap;
 use gpui::{Context, ModelContext};
+use log::{error, info};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use std::{io::Read, num::NonZeroU64, sync::Arc};
 
@@ -17,7 +18,7 @@ use worktree::File;
 #[derive(Default)]
 pub struct Notebook {
     file: Option<Arc<dyn language::File>>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: usize,
     nbformat_minor: usize,
@@ -27,7 +28,7 @@ pub struct Notebook {
 struct NotebookBuilder<'nbb, 'cx: 'nbb> {
     cx: &'nbb mut ModelContext<'cx, Notebook>,
     file: Option<Arc<dyn language::File>>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: Option<usize>,
     nbformat_minor: Option<usize>,
@@ -79,22 +80,35 @@ where
         A: de::MapAccess<'de>,
     {
         while let Some((key, val)) = map.next_entry()? {
-            match key {
-                "metadata" => self.metadata = parse_value(val)?,
-                "nbformat" => self.nbformat = parse_value(val)?,
-                "nbformat_minor" => self.nbformat_minor = parse_value(val)?,
-                "cells" => {
-                    let items: Vec<serde_json::Map<String, serde_json::Value>> = parse_value(val)?;
-                    for (idx, item) in items.into_iter().enumerate() {
-                        let id: CellId = NonZeroU64::new(idx as u64)
-                            .ok_or_else(|| A::Error::custom("Nope"))?
-                            .into();
-                        let cell_builder = CellBuilder::new(&mut self.cx, id, item);
-                        let cell = cell_builder.build();
-                        self.cells.push_cell(cell, &());
+            let result_parse_entry = (|| -> Result<(), A::Error> {
+                match key {
+                    "metadata" => self.metadata = parse_value(val)?,
+                    "nbformat" => self.nbformat = parse_value(val)?,
+                    "nbformat_minor" => self.nbformat_minor = parse_value(val)?,
+                    "cells" => {
+                        let items: Vec<serde_json::Map<String, serde_json::Value>> =
+                            parse_value(val)?;
+                        for (idx, item) in items.into_iter().enumerate() {
+                            let id: CellId = NonZeroU64::new(idx as u64 + 1)
+                                .ok_or_else(|| A::Error::custom("Nope"))?
+                                .into();
+                            let cell_builder = CellBuilder::new(&mut self.cx, id, item);
+                            let cell = cell_builder.build();
+                            self.cells.push_cell(cell, &());
+                        }
                     }
-                }
-                _ => {}
+                    _ => {}
+                };
+                Ok(())
+            })();
+
+            match result_parse_entry {
+                Ok(()) => log::info!("Successfully parsed notebook entry with key '{:#?}'", key),
+                Err(err) => log::error!(
+                    "Failed to parse notebook entry with key '{:#?}': {:#?}",
+                    key,
+                    err
+                ),
             }
         }
         Ok(self)
@@ -126,8 +140,10 @@ impl project::Item for Notebook {
         Self: Sized,
     {
         if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
+            info!("Failed to detect extension for path `{:#?}`", path);
             return None;
         }
+        info!("Detected `.ipynb` extension for path `{:#?}`", path);
 
         let project = project_handle.downgrade();
         let open_buffer_task =
@@ -136,12 +152,19 @@ impl project::Item for Notebook {
         let task = app_cx.spawn(|mut cx| async move {
             let buffer_handle = open_buffer_task?.await?;
 
+            info!("Successfully opened buffer");
+
             cx.new_model(move |cx_model| {
                 let buffer = buffer_handle.read(cx_model);
                 let mut bytes = Vec::<u8>::with_capacity(buffer.len());
-                let _ = buffer
+                let n_bytes_maybe_read = buffer
                     .bytes_in_range(0..buffer.len())
                     .read_to_end(&mut bytes);
+
+                match n_bytes_maybe_read {
+                    Ok(n_bytes) => info!("Successfully read {} bytes from buffer", n_bytes),
+                    Err(err) => error!("{:#?}", err),
+                }
 
                 let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
 
