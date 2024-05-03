@@ -11,6 +11,7 @@ use gpui::{
 use itertools::Itertools;
 use language::{self, Buffer, Capability};
 use project::{self, Project, ProjectPath};
+use serde::de::DeserializeSeed;
 use serde_derive::Deserialize;
 use std::{any::Any, io::Read, ops::Range};
 use ui::{
@@ -41,7 +42,8 @@ impl NotebookEditor {
                 let range = ExcerptRange {
                     context: Range {
                         start: 0 as usize,
-                        end: cell.source.read(cx).row_count() as usize,
+                        // end: cell.source.read(cx).row_count() as usize,
+                        end: 0 as usize,
                     },
                     primary: None,
                 };
@@ -172,6 +174,15 @@ impl workspace::item::ProjectItem for NotebookEditor {
         NotebookEditor::new(project, notebook, cx)
     }
 }
+
+// TODO: We'll need to be able to serialize/deserialize the `NotebookEditor` for application restarts.
+// impl DeserializeSeed for NotebookEditor {
+//     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+//     where
+//         D: serde::Deserializer<'de> {
+//             let notebook =
+//         }
+// }
 
 pub fn init(cx: &mut AppContext) {
     workspace::register_project_item::<NotebookEditor>(cx);
