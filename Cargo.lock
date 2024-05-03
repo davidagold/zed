@@ -6539,6 +6539,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "notebook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compat",
+ "collections",
+ "command_palette",
+ "command_palette_hooks",
+ "editor",
+ "gpui",
+ "indoc",
+ "itertools 0.11.0",
+ "language",
+ "log",
+ "lsp",
+ "parking_lot",
+ "project",
+ "release_channel",
+ "rope",
+ "runtimelib",
+ "schemars",
+ "search",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "settings",
+ "sum_tree",
+ "text",
+ "tokio",
+ "ui",
+ "util",
+ "workspace",
+ "worktree",
+ "zed_actions",
+]
+
+[[package]]
 name = "notifications"
 version = "0.1.0"
 dependencies = [
@@ -13041,6 +13078,7 @@ dependencies = [
  "mimalloc",
  "nix 0.28.0",
  "node_runtime",
+ "notebook",
  "notifications",
  "outline",
  "parking_lot",
