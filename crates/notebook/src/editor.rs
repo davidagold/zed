@@ -1,25 +1,23 @@
 //! Jupyter support for Zed.
 
-use collections::HashMap;
 use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptRange, MultiBuffer, MAX_TAB_TITLE_LEN,
 };
 use gpui::{
     impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model,
-    ModelContext, ParentElement, View, WeakView,
+    ParentElement, View, WeakView,
 };
 use itertools::Itertools;
-use language::{self, Buffer, Capability};
-use project::{self, Project, ProjectPath};
-use serde::de::DeserializeSeed;
+use language::{self, Capability};
+use project::{self, Project};
 use serde_derive::Deserialize;
-use std::{any::Any, io::Read, ops::Range};
+use std::{any::Any, ops::Range};
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
     SharedString, Styled, ViewContext, VisualContext,
 };
 use util::paths::PathExt;
-use workspace::item::{Item, ItemEvent, ItemHandle};
+use workspace::item::ItemEvent;
 
 use crate::{cell::Cell, Notebook};
 
