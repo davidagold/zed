@@ -88,10 +88,12 @@ where
                     "cells" => {
                         let items: Vec<serde_json::Map<String, serde_json::Value>> =
                             parse_value(val)?;
+
                         for (idx, item) in items.into_iter().enumerate() {
                             let id: CellId = NonZeroU64::new(idx as u64 + 1)
                                 .ok_or_else(|| A::Error::custom("Nope"))?
                                 .into();
+
                             let cell_builder = CellBuilder::new(&mut self.cx, id, item);
                             let cell = cell_builder.build();
                             self.cells.push_cell(cell, &());
