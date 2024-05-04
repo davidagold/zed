@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod cell;
 mod common;
 pub mod editor;
@@ -99,12 +100,13 @@ where
 
                             let cell_builder =
                                 CellBuilder::new(&mut self.project_handle, &mut self.cx, id, item);
-                            let cell = cell_builder.build();
-                            self.cells.push_cell(cell, &());
+
+                            self.cells.push_cell(cell_builder.build(), &());
                         }
                     }
                     _ => {}
                 };
+
                 Ok(())
             })();
 
