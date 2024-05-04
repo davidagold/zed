@@ -4,19 +4,23 @@ use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptRange, MultiBuffer, MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
-    Subscription, View,
+    AnyView, AppContext, Context, Entity, EventEmitter, FocusHandle, FocusableView, Model,
+    ParentElement, Subscription, View,
 };
 use itertools::Itertools;
 use language::{self, Capability};
 use project::{self, Project};
-use std::{any::Any, convert::AsRef, ops::Range};
+use std::{
+    any::{Any, TypeId},
+    convert::AsRef,
+    ops::Range,
+};
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
-    SharedString, Styled, ViewContext, VisualContext,
+    SharedString, Styled, StyledTypography, ViewContext, VisualContext,
 };
 use util::paths::PathExt;
-use workspace::item::ItemEvent;
+use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
@@ -167,14 +171,37 @@ impl workspace::item::Item for NotebookEditor {
     fn serialized_item_kind() -> Option<&'static str> {
         Some(NOTEBOOK_KIND)
     }
+
+    fn for_each_project_item(
+        &self,
+        cx: &AppContext,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::Item),
+    ) {
+        self.editor.read(cx).for_each_project_item(cx, f)
+    }
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: TypeId,
+        self_handle: &'a View<Self>,
+        cx: &'a AppContext,
+    ) -> Option<AnyView> {
+        if type_id == TypeId::of::<Self>() {
+            Some(self_handle.to_any())
+        } else if type_id == TypeId::of::<Editor>() {
+            Some(self.editor.to_any())
+        } else {
+            None
+        }
+    }
 }
 
 impl EventEmitter<EditorEvent> for NotebookEditor {}
 
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-        // self.focus_handle.clone()
-        self.editor.focus_handle(cx).clone()
+        self.focus_handle.clone()
+        // self.editor.focus_handle(cx).clone()
     }
 }
 
@@ -183,7 +210,7 @@ impl Render for NotebookEditor {
         let child = self.editor.clone();
 
         div()
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.editor.focus_handle(cx))
             .size_full()
             .child(child)
             .on_action(cx.listener(NotebookEditor::run_current_cell))

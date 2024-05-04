@@ -4,10 +4,12 @@ mod common;
 pub mod editor;
 
 use crate::cell::{CellId, Cells};
-use crate::common::parse_value;
+use crate::common::{parse_value, python_lang};
 use cell::CellBuilder;
 use collections::HashMap;
 use gpui::{Context, ModelContext, WeakModel};
+use itertools::Itertools;
+use language::LanguageServerName;
 use log::{error, info};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use std::{io::Read, num::NonZeroU64, sync::Arc};
@@ -147,10 +149,13 @@ impl project::Item for Notebook {
     where
         Self: Sized,
     {
-        if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
-            info!("Failed to detect extension for path `{:#?}`", path);
-            return None;
-        }
+        project_handle.update(app_cx, |project, cx| {
+            let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
+                return;
+            };
+            project.start_language_servers(&worktree, Arc::new(python_lang()), cx);
+        });
+
         info!("Detected `.ipynb` extension for path `{:#?}`", path);
 
         let project = project_handle.downgrade();
@@ -176,15 +181,14 @@ impl project::Item for Notebook {
                 }
 
                 let file = buffer.file().map(|file| file.clone());
-
                 let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-
                 NotebookBuilder::new(project, file, cx_model)
                     .deserialize(&mut deserializer)
                     .map(|builder| builder.build())
                     .unwrap_or_default()
             })
         });
+
         Some(task)
     }
 
