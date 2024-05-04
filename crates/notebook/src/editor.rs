@@ -5,13 +5,13 @@ use editor::{
 };
 use gpui::{
     impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model,
-    ParentElement, View, WeakView,
+    ParentElement, Subscription, View, WeakView,
 };
 use itertools::Itertools;
 use language::{self, Capability};
 use project::{self, Project};
 use serde_derive::Deserialize;
-use std::{any::Any, ops::Range};
+use std::{any::Any, convert::AsRef, ops::Range};
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
     SharedString, Styled, ViewContext, VisualContext,
@@ -28,6 +28,7 @@ pub struct NotebookEditor {
     // editors: HashMap<CellId, View<Editor>>,
     editor: View<Editor>,
     focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl NotebookEditor {
@@ -53,17 +54,35 @@ impl NotebookEditor {
             }
             multi
         });
+
         let editor = cx.new_view(|cx| {
             let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
             editor.set_vertical_scroll_margin(5, cx);
             editor
         });
 
+        let subscription = cx.subscribe(&project, |this, project, event, cx| {
+            // language::Event::
+            log::info!("Event: {:#?}", event);
+        });
+
+        cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
+            cx.emit(event.clone());
+        })
+        .detach();
+
+        let focus_handle = cx.focus_handle();
+        cx.on_focus_in(&focus_handle, |this, cx| {
+            this.editor.focus_handle(cx).focus(cx)
+        })
+        .detach();
+
         NotebookEditor {
             active_cell: None,
             notebook,
             editor,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            _subscriptions: [subscription].into(),
         }
     }
 }
@@ -103,7 +122,7 @@ impl workspace::item::Item for NotebookEditor {
         let title = (&self.notebook).read(cx).file.as_ref().and_then(|f| {
             let path = f.as_local()?.abs_path(cx);
             Some(util::truncate_and_trailoff(
-                path.to_str()?,
+                path.file_name()?.to_string_lossy().as_ref(),
                 MAX_TAB_TITLE_LEN,
             ))
         });
@@ -141,6 +160,7 @@ impl EventEmitter<EditorEvent> for NotebookEditor {}
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
         self.focus_handle.clone()
+        // self.editor.focus_handle(cx).clone()
     }
 }
 
