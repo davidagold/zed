@@ -1,15 +1,16 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use gpui::{AppContext, Flatten, Model, WeakModel};
-use language::{Buffer, File, Language, LanguageConfig, LanguageMatcher};
+use language::{Buffer, File};
 
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use std::{any::Any, fmt::Debug, num::NonZeroU64, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use tree_sitter_python;
 use ui::Context;
+
+use crate::common::python_lang;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -136,21 +137,10 @@ impl CellBuilder {
                         project_handle
                             .update(cx, |project, project_cx| -> Result<()> {
                                 // TODO: Detect this from the file. Also, get it to work.
-                                let python_lang = Language::new(
-                                    LanguageConfig {
-                                        name: "Python".into(),
-                                        matcher: LanguageMatcher {
-                                            path_suffixes: vec!["rs".to_string()],
-                                            ..Default::default()
-                                        },
-                                        ..Default::default()
-                                    },
-                                    Some(tree_sitter_python::language()),
-                                );
 
                                 let source_buffer = project.create_buffer(
                                     source_lines.join("\n").as_str(),
-                                    Some(Arc::new(python_lang)),
+                                    Some(Arc::new(python_lang())),
                                     project_cx,
                                 )?;
 
