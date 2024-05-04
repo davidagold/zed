@@ -1,18 +1,18 @@
+use anyhow::{anyhow, Result};
 use collections::HashMap;
-use gpui::{AppContext, Context, Flatten, Model, WeakModel};
-use language::{Buffer, Language, LanguageConfig, LanguageMatcher};
+use gpui::{AppContext, Flatten, Model, WeakModel};
+use language::{Buffer, File, Language, LanguageConfig, LanguageMatcher};
 
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
-use std::{fmt::Debug, num::NonZeroU64, sync::Arc};
+use std::{any::Any, fmt::Debug, num::NonZeroU64, sync::Arc};
 use sum_tree::{SumTree, Summary};
 use tree_sitter_python;
+use ui::Context;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
-    // The following should be owned by the underlying Buffer
-    // TODO: Make an ID type?
     idx: CellId,
     cell_id: Option<String>,
     cell_type: CellType,
@@ -21,8 +21,6 @@ pub struct Cell {
     execution_count: Option<usize>,
 }
 
-// Including the `cx: AppContext` in the builder, which is the direct target of deserialization,
-// allows us to pass the `cx` along as we deserialize via `DeserializeSeed::deserialize`.
 pub struct CellBuilder {
     idx: CellId,
     cell_id: Option<String>,
@@ -35,6 +33,60 @@ pub struct CellBuilder {
 impl Debug for CellBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "`cell_id`: {:#?}", self.cell_id)
+    }
+}
+
+// A phony file struct we use for excerpt titles.
+struct PhonyFile {
+    worktree_id: usize,
+    title: Arc<std::path::Path>,
+    cell_idx: CellId,
+    cell_id: Option<String>,
+}
+
+impl File for PhonyFile {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn mtime(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    fn path(&self) -> &Arc<std::path::Path> {
+        &self.title
+    }
+
+    fn full_path(&self, _cx: &AppContext) -> std::path::PathBuf {
+        self.title.to_path_buf()
+    }
+
+    fn file_name<'a>(&'a self, _cx: &'a AppContext) -> &'a std::ffi::OsStr {
+        &self.title.as_os_str()
+    }
+
+    fn worktree_id(&self) -> usize {
+        self.worktree_id
+    }
+
+    fn is_deleted(&self) -> bool {
+        false
+    }
+
+    fn is_created(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self as &dyn Any
+    }
+
+    fn to_proto(&self) -> rpc::proto::File {
+        unimplemented!()
+    }
+
+    fn is_private(&self) -> bool {
+        false
     }
 }
 
@@ -55,7 +107,7 @@ impl CellBuilder {
         };
 
         for (key, val) in map {
-            let result_parse_entry = (|| -> anyhow::Result<()> {
+            let result_parse_entry = (|| -> Result<()> {
                 match key.as_str() {
                     "cell_id" => this.cell_id = val.as_str().map(|s| s.to_string()),
                     "cell_type" => {
@@ -63,27 +115,27 @@ impl CellBuilder {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
-                        let mut source_lines = Vec::<String>::new();
-
-                        match val {
-                            serde_json::Value::String(src) => Ok(source_lines.push(src)),
-                            serde_json::Value::Array(src_lines) => {
-                                src_lines.into_iter().try_fold((), |_, line_as_val| {
-                                    let line = line_as_val.as_str()?;
+                        let source_lines: Vec<String> = match val {
+                            serde_json::Value::String(src) => Ok([src].into()),
+                            serde_json::Value::Array(src_lines) => src_lines.into_iter().try_fold(
+                                Vec::<String>::new(),
+                                |mut source_lines, line_as_val| {
+                                    let line = line_as_val.as_str().ok_or_else(|| {
+                                        anyhow!("Source line `{:#?}` is not a string", line_as_val)
+                                    })?;
 
                                     source_lines
                                         .push(line.strip_suffix("\n").unwrap_or(line).to_string());
 
-                                    Some(())
-                                });
-
-                                Ok(())
-                            }
+                                    Ok(source_lines)
+                                },
+                            ),
                             _ => Err(anyhow::anyhow!("Unexpected source format: {:#?}", val)),
                         }?;
 
                         project_handle
-                            .update(cx, |project, project_cx| -> anyhow::Result<()> {
+                            .update(cx, |project, project_cx| -> Result<()> {
+                                // TODO: Detect this from the file. Also, get it to work.
                                 let python_lang = Language::new(
                                     LanguageConfig {
                                         name: "Python".into(),
@@ -113,6 +165,19 @@ impl CellBuilder {
                     }
                     _ => {}
                 };
+                let title_text = format!("Cell {:#?}", idx.0);
+                let title = PhonyFile {
+                    worktree_id: 0,
+                    title: Arc::from(std::path::Path::new(title_text.as_str())),
+                    cell_idx: idx.clone(),
+                    cell_id: this.cell_id.clone(),
+                };
+
+                if let Some(buffer_handle) = &this.source {
+                    cx.update_model(&buffer_handle, |buffer, cx| {
+                        buffer.file_updated(Arc::new(title), cx);
+                    });
+                }
 
                 Ok(())
             })();

@@ -4,13 +4,12 @@ use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptRange, MultiBuffer, MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    impl_actions, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model,
-    ParentElement, Subscription, View, WeakView,
+    AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    Subscription, View,
 };
 use itertools::Itertools;
 use language::{self, Capability};
 use project::{self, Project};
-use serde_derive::Deserialize;
 use std::{any::Any, convert::AsRef, ops::Range};
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
@@ -19,13 +18,14 @@ use ui::{
 use util::paths::PathExt;
 use workspace::item::ItemEvent;
 
-use crate::{cell::Cell, Notebook};
+use crate::{
+    actions,
+    cell::{Cell, CellId},
+    Notebook,
+};
 
-// #[derive(Default)]
 pub struct NotebookEditor {
-    active_cell: Option<WeakView<Cell>>,
     notebook: Model<Notebook>,
-    // editors: HashMap<CellId, View<Editor>>,
     editor: View<Editor>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -62,7 +62,6 @@ impl NotebookEditor {
         });
 
         let subscription = cx.subscribe(&project, |this, project, event, cx| {
-            // language::Event::
             log::info!("Event: {:#?}", event);
         });
 
@@ -72,19 +71,34 @@ impl NotebookEditor {
         .detach();
 
         let focus_handle = cx.focus_handle();
-        cx.on_focus_in(&focus_handle, |this, cx| {
-            this.editor.focus_handle(cx).focus(cx)
-        })
-        .detach();
+        // cx.on_focus_in(&focus_handle, |this, cx| {}).detach();
 
-        NotebookEditor {
-            active_cell: None,
+        let this = NotebookEditor {
             notebook,
             editor,
             focus_handle,
             _subscriptions: [subscription].into(),
-        }
+        };
+
+        this
     }
+
+    fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
+        let (excerpt_id, buffer_handle, _range) = match self.editor.read(cx).active_excerpt(cx) {
+            Some(data) => data,
+            None => return,
+        };
+        let entity_id = cx.entity_id();
+        let buffer = buffer_handle.read(cx);
+        log::info!(
+            "Active cell's `NotebookEditor`'s `EntityId`: {:#?}",
+            entity_id
+        );
+        log::info!("Active cell's `ExcerptId`: {:#?}", excerpt_id);
+        log::info!("Active cell's buffer: {:#?}", buffer.text());
+    }
+
+    fn toggle_notebook_view(&mut self, cmd: &super::actions::ToggleNotebookView) {}
 }
 
 const NOTEBOOK_KIND: &'static str = "NotebookEditor";
@@ -159,8 +173,8 @@ impl EventEmitter<EditorEvent> for NotebookEditor {}
 
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-        self.focus_handle.clone()
-        // self.editor.focus_handle(cx).clone()
+        // self.focus_handle.clone()
+        self.editor.focus_handle(cx).clone()
     }
 }
 
@@ -172,6 +186,7 @@ impl Render for NotebookEditor {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(child)
+            .on_action(cx.listener(NotebookEditor::run_current_cell))
     }
 }
 
@@ -190,23 +205,6 @@ impl workspace::item::ProjectItem for NotebookEditor {
     }
 }
 
-// TODO: We'll need to be able to serialize/deserialize the `NotebookEditor` for application restarts.
-// impl DeserializeSeed for NotebookEditor {
-//     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-//     where
-//         D: serde::Deserializer<'de> {
-//             let notebook =
-//         }
-// }
-
 pub fn init(cx: &mut AppContext) {
     workspace::register_project_item::<NotebookEditor>(cx);
 }
-
-#[derive(Clone, Deserialize, PartialEq)]
-pub enum ToggleNotebookView {
-    NotebookEditor,
-    Raw,
-}
-
-impl_actions!(workspace, [ToggleNotebookView]);
