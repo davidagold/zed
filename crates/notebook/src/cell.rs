@@ -73,6 +73,7 @@ impl<'de> CellBuilder<'de> {
                             serde_json::Value::Array(src_lines) => {
                                 src_lines.into_iter().try_fold((), |_, line_as_val| {
                                     let line = line_as_val.as_str()?;
+
                                     source_lines
                                         .push(line.strip_suffix("\n").unwrap_or(line).to_string());
 
@@ -169,19 +170,6 @@ impl<'de> serde::Deserialize<'de> for CellType {
     }
 }
 
-// TODO: Appropriate deserialize of `source` from `CellSource` (`String`/`Vec<String>`) values
-#[derive(Debug, Deserialize)]
-pub enum CellSource {
-    String(String),
-    MultiLineString(Vec<String>),
-}
-
-impl Default for CellSource {
-    fn default() -> CellSource {
-        CellSource::String("".into())
-    }
-}
-
 #[derive(Default)]
 pub struct Cells(SumTree<Cell>);
 
@@ -199,7 +187,6 @@ impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
     fn summary(&self) -> Self::Summary {
-        // let CellSource(source) = self.source;
         CellSummary {
             cell_type: self.cell_type.clone(),
             // text_summary: source.base_text().summary(),
@@ -227,30 +214,6 @@ impl Summary for CellSummary {
     type Context = ();
 
     fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {}
-}
-
-// impl FocusableView for Cell {
-//     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-//         self.focus_handle.clone()
-//     }
-// }
-
-impl Cell {
-    fn handle_focus(&mut self, cx: &mut ViewContext<Self>) {}
-}
-
-struct CellView {
-    offset: usize,
-    focus_handle: FocusHandle,
-}
-
-impl Render for CellView {
-    fn render(
-        &mut self,
-        _cx: &mut ui::prelude::ViewContext<Self>,
-    ) -> impl ui::prelude::IntoElement {
-        gpui::Empty
-    }
 }
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
