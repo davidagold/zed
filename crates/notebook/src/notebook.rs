@@ -6,7 +6,7 @@ use crate::cell::{CellId, Cells};
 use crate::common::parse_value;
 use cell::CellBuilder;
 use collections::HashMap;
-use gpui::{Context, ModelContext};
+use gpui::{Context, ModelContext, WeakModel};
 use log::{error, info};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use std::{io::Read, num::NonZeroU64, sync::Arc};
@@ -26,8 +26,9 @@ pub struct Notebook {
 }
 
 struct NotebookBuilder<'nbb, 'cx: 'nbb> {
-    cx: &'nbb mut ModelContext<'cx, Notebook>,
+    project_handle: WeakModel<project::Project>,
     file: Option<Arc<dyn language::File>>,
+    cx: &'nbb mut ModelContext<'cx, Notebook>,
     metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: Option<usize>,
@@ -37,12 +38,14 @@ struct NotebookBuilder<'nbb, 'cx: 'nbb> {
 
 impl<'nbb, 'cx: 'nbb> NotebookBuilder<'nbb, 'cx> {
     fn new(
+        project_handle: WeakModel<project::Project>,
         file: Option<Arc<dyn language::File>>,
         cx: &'nbb mut ModelContext<'cx, Notebook>,
     ) -> NotebookBuilder<'nbb, 'cx> {
         NotebookBuilder {
-            cx,
+            project_handle,
             file,
+            cx,
             metadata: None,
             nbformat: None,
             nbformat_minor: None,
@@ -94,7 +97,8 @@ where
                                 .ok_or_else(|| A::Error::custom("Nope"))?
                                 .into();
 
-                            let cell_builder = CellBuilder::new(&mut self.cx, id, item);
+                            let cell_builder =
+                                CellBuilder::new(&mut self.project_handle, &mut self.cx, id, item);
                             let cell = cell_builder.build();
                             self.cells.push_cell(cell, &());
                         }
@@ -159,18 +163,21 @@ impl project::Item for Notebook {
             cx.new_model(move |cx_model| {
                 let buffer = buffer_handle.read(cx_model);
                 let mut bytes = Vec::<u8>::with_capacity(buffer.len());
+
                 let n_bytes_maybe_read = buffer
                     .bytes_in_range(0..buffer.len())
                     .read_to_end(&mut bytes);
 
                 match n_bytes_maybe_read {
-                    Ok(n_bytes) => info!("Successfully read {} bytes from buffer", n_bytes),
-                    Err(err) => error!("{:#?}", err),
+                    Ok(n_bytes) => info!("Successfully read {} bytes from notebook file", n_bytes),
+                    Err(err) => error!("Failed to read from notebook file: {:#?}", err),
                 }
+
+                let file = buffer.file().map(|file| file.clone());
 
                 let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
 
-                NotebookBuilder::new(buffer.file().map(|file| file.clone()), cx_model)
+                NotebookBuilder::new(project, file, cx_model)
                     .deserialize(&mut deserializer)
                     .map(|builder| builder.build())
                     .unwrap_or_default()

@@ -1,15 +1,13 @@
-use std::{fmt::Debug, num::NonZeroU64};
-
-use anyhow::anyhow;
 use collections::HashMap;
-use gpui::{AppContext, Context, FocusHandle, Model};
-use itertools::Itertools;
-use language::Buffer;
-use rope::Rope;
+use gpui::{AppContext, Context, Flatten, Model, WeakModel};
+use language::{Buffer, Language, LanguageConfig, LanguageMatcher};
+
+use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
+use std::{fmt::Debug, num::NonZeroU64, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::{Render, ViewContext};
+use tree_sitter_python;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -25,8 +23,7 @@ pub struct Cell {
 
 // Including the `cx: AppContext` in the builder, which is the direct target of deserialization,
 // allows us to pass the `cx` along as we deserialize via `DeserializeSeed::deserialize`.
-pub struct CellBuilder<'de> {
-    cx: &'de mut AppContext,
+pub struct CellBuilder {
     idx: CellId,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
@@ -35,20 +32,20 @@ pub struct CellBuilder<'de> {
     execution_count: Option<usize>,
 }
 
-impl<'de> Debug for CellBuilder<'de> {
+impl Debug for CellBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "`cell_id`: {:#?}", self.cell_id)
     }
 }
 
-impl<'de> CellBuilder<'de> {
+impl CellBuilder {
     pub fn new(
+        project_handle: &mut WeakModel<Project>,
         cx: &mut AppContext,
         idx: CellId,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> CellBuilder {
         let mut this = CellBuilder {
-            cx,
             idx,
             cell_id: None,
             cell_type: None,
@@ -85,11 +82,31 @@ impl<'de> CellBuilder<'de> {
                             _ => Err(anyhow::anyhow!("Unexpected source format: {:#?}", val)),
                         }?;
 
-                        let source_buf = this
-                            .cx
-                            .new_model(|model_cx| Buffer::local(source_lines.join("\n"), model_cx));
+                        project_handle
+                            .update(cx, |project, project_cx| -> anyhow::Result<()> {
+                                let python_lang = Language::new(
+                                    LanguageConfig {
+                                        name: "Python".into(),
+                                        matcher: LanguageMatcher {
+                                            path_suffixes: vec!["rs".to_string()],
+                                            ..Default::default()
+                                        },
+                                        ..Default::default()
+                                    },
+                                    Some(tree_sitter_python::language()),
+                                );
 
-                        this.source.replace(source_buf);
+                                let source_buffer = project.create_buffer(
+                                    source_lines.join("\n").as_str(),
+                                    Some(Arc::new(python_lang)),
+                                    project_cx,
+                                )?;
+
+                                this.source.replace(source_buffer);
+
+                                Ok(())
+                            })
+                            .flatten()?;
                     }
                     "execution_count" => {
                         this.execution_count = serde_json::from_value(val).unwrap_or_default()
