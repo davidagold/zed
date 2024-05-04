@@ -32,26 +32,23 @@ pub struct NotebookEditor {
 
 impl NotebookEditor {
     fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let cells = notebook
+        let cell_sources = notebook
             .read(cx)
             .cells
             .iter()
-            .map(|cell| {
-                let range = ExcerptRange {
-                    context: Range {
-                        start: 0 as usize,
-                        // end: cell.source.read(cx).row_count() as usize,
-                        end: 0 as usize,
-                    },
-                    primary: None,
-                };
-                (cell.source.clone(), range)
-            })
+            .map(|cell| cell.source.clone())
             .collect_vec();
 
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-            for (source, range) in cells {
+            for source in cell_sources {
+                let range = ExcerptRange {
+                    context: Range {
+                        start: 0 as usize,
+                        end: source.read(model_cx).len() as usize,
+                    },
+                    primary: None,
+                };
                 multi.push_excerpts(source, [range].to_vec(), model_cx);
             }
             multi
