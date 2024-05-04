@@ -1,8 +1,11 @@
 use std::{fmt::Debug, num::NonZeroU64};
 
+use anyhow::anyhow;
 use collections::HashMap;
 use gpui::{AppContext, Context, FocusHandle, Model};
+use itertools::Itertools;
 use language::Buffer;
+use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use sum_tree::{SumTree, Summary};
@@ -63,16 +66,28 @@ impl<'de> CellBuilder<'de> {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
-                        let source: CellSource = serde_json::from_value(val).unwrap_or_default();
-                        let source_text = match source {
-                            CellSource::String(src) => src,
-                            CellSource::MultiLineString(src_lines) => {
-                                src_lines.join("\n").to_string()
+                        let mut source_lines = Vec::<String>::new();
+
+                        match val {
+                            serde_json::Value::String(src) => Ok(source_lines.push(src)),
+                            serde_json::Value::Array(src_lines) => {
+                                src_lines.into_iter().try_fold((), |_, line_as_val| {
+                                    let line = line_as_val.as_str()?;
+                                    source_lines
+                                        .push(line.strip_suffix("\n").unwrap_or(line).to_string());
+
+                                    Some(())
+                                });
+
+                                Ok(())
                             }
-                        };
+                            _ => Err(anyhow::anyhow!("Unexpected source format: {:#?}", val)),
+                        }?;
+
                         let source_buf = this
                             .cx
-                            .new_model(|model_cx| Buffer::local(source_text, model_cx));
+                            .new_model(|model_cx| Buffer::local(source_lines.join("\n"), model_cx));
+
                         this.source.replace(source_buf);
                     }
                     "execution_count" => {
