@@ -24,8 +24,10 @@ itertools.workspace = true
 language.workspace = true
 languages.workspace = true
 log.workspace = true
+multi_buffer.workspace = true
 project.workspace = true
 rope.workspace = true
+rpc.workspace = true
 runtimelib = { git = "https://github.com/runtimed/runtimed", version = "0.1.0" }
 schemars.workspace = true
 search.workspace = true
