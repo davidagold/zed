@@ -168,36 +168,35 @@ impl NotebookEditor {
         syntax: &SyntaxTheme,
         cx: &ViewContext<T>,
     ) -> Vec<(Range<multi_buffer::Anchor>, HighlightStyle)> {
-        editor.buffer().read_with(cx, |multi, cx| {
-            highlights_by_range
-                .iter()
-                .flat_map(|(rng, h)| {
-                    multi
-                        .range_to_buffer_ranges(rng.clone(), cx)
-                        .iter()
-                        .filter_map(|(_buf, range, excerpt_id)| {
-                            if only_for_excerpt_ids.is_some()
-                                && (!only_for_excerpt_ids
-                                    .as_ref()
-                                    .unwrap()
-                                    .iter()
-                                    .any(|id| id == excerpt_id))
-                            {
-                                return None;
-                            }
-                            let rng = Range {
-                                start: multi.snapshot(cx).anchor_before(range.start),
-                                end: multi.snapshot(cx).anchor_before(range.end),
-                            };
-                            match h.style(&syntax) {
-                                Some(style) => Some((rng, style)),
-                                None => None,
-                            }
-                        })
-                        .collect_vec()
-                })
-                .collect_vec()
-        })
+        let multi = editor.buffer().read(cx);
+        highlights_by_range
+            .iter()
+            .flat_map(|(rng, h)| {
+                multi
+                    .range_to_buffer_ranges(rng.clone(), cx)
+                    .iter()
+                    .filter_map(|(_buf, range, excerpt_id)| {
+                        if only_for_excerpt_ids.is_some()
+                            && (!only_for_excerpt_ids
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .any(|id| id == excerpt_id))
+                        {
+                            return None;
+                        }
+                        let rng = Range {
+                            start: multi.snapshot(cx).anchor_before(range.start),
+                            end: multi.snapshot(cx).anchor_before(range.end),
+                        };
+                        match h.style(&syntax) {
+                            Some(style) => Some((rng, style)),
+                            None => None,
+                        }
+                    })
+                    .collect_vec()
+            })
+            .collect_vec()
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
