@@ -171,11 +171,11 @@ impl NotebookEditor {
         let multi = editor.buffer().read(cx);
         highlights_by_range
             .iter()
-            .flat_map(|(rng, h)| {
+            .flat_map(|(range, h)| {
                 multi
-                    .range_to_buffer_ranges(rng.clone(), cx)
+                    .range_to_buffer_ranges(range.clone(), cx)
                     .iter()
-                    .filter_map(|(_buf, range, excerpt_id)| {
+                    .filter_map(|(_buffer, range, excerpt_id)| {
                         if only_for_excerpt_ids.is_some()
                             && (!only_for_excerpt_ids
                                 .as_ref()
@@ -185,14 +185,12 @@ impl NotebookEditor {
                         {
                             return None;
                         }
-                        let rng = Range {
+                        let range = Range {
                             start: multi.snapshot(cx).anchor_before(range.start),
                             end: multi.snapshot(cx).anchor_before(range.end),
                         };
-                        match h.style(&syntax) {
-                            Some(style) => Some((rng, style)),
-                            None => None,
-                        }
+                        let style = h.style(&syntax)?;
+                        Some((range, style))
                     })
                     .collect_vec()
             })
