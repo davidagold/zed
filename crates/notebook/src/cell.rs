@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
+use editor::ExcerptId;
 use gpui::{AppContext, Flatten, Model, WeakModel};
 use language::{Buffer, File};
 
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
-use std::{any::Any, fmt::Debug, num::NonZeroU64, sync::Arc};
+use std::{any::Any, fmt::Debug, sync::Arc};
 use sum_tree::{SumTree, Summary};
 use ui::Context;
 
@@ -14,7 +15,8 @@ use crate::common::python_lang;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
-    idx: CellId,
+    pub id: CellId,
+    // `cell_id` is a notebook field
     cell_id: Option<String>,
     cell_type: CellType,
     metadata: HashMap<String, serde_json::Value>,
@@ -23,7 +25,7 @@ pub struct Cell {
 }
 
 pub struct CellBuilder {
-    idx: CellId,
+    id: u64,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
     metadata: Option<HashMap<String, serde_json::Value>>,
@@ -95,11 +97,11 @@ impl CellBuilder {
     pub fn new(
         project_handle: &mut WeakModel<Project>,
         cx: &mut AppContext,
-        idx: CellId,
+        id: u64,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> CellBuilder {
         let mut this = CellBuilder {
-            idx,
+            id,
             cell_id: None,
             cell_type: None,
             metadata: None,
@@ -156,11 +158,12 @@ impl CellBuilder {
                     }
                     _ => {}
                 };
-                let title_text = format!("Cell {:#?}", idx.0);
+
+                let title_text = format!("Cell {:#?}", id);
                 let title = PhonyFile {
                     worktree_id: 0,
                     title: Arc::from(std::path::Path::new(title_text.as_str())),
-                    cell_idx: idx.clone(),
+                    cell_idx: CellId(id),
                     cell_id: this.cell_id.clone(),
                 };
 
@@ -188,7 +191,7 @@ impl CellBuilder {
 
     pub fn build(self) -> Cell {
         Cell {
-            idx: self.idx,
+            id: CellId(self.id),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
             metadata: self.metadata.unwrap(),
@@ -269,11 +272,23 @@ impl sum_tree::Item for Cell {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
-pub struct CellId(NonZeroU64);
+pub struct CellId(u64);
 
-impl From<NonZeroU64> for CellId {
-    fn from(id: NonZeroU64) -> Self {
-        CellId(id)
+impl From<ExcerptId> for CellId {
+    fn from(excerpt_id: ExcerptId) -> Self {
+        CellId(excerpt_id.to_proto())
+    }
+}
+
+impl Into<u64> for CellId {
+    fn into(self) -> u64 {
+        self.0
+    }
+}
+
+impl Into<ExcerptId> for CellId {
+    fn into(self) -> ExcerptId {
+        ExcerptId::from_proto(self.into())
     }
 }
 

@@ -101,7 +101,7 @@ where
                             parse_value(val)?;
 
                         for (idx, item) in items.into_iter().enumerate() {
-                            let id: CellId = NonZeroU64::new(idx as u64 + 1)
+                            let id = NonZeroU64::new(idx as u64 + 1)
                                 .ok_or_else(|| A::Error::custom("Nope"))?
                                 .into();
 
