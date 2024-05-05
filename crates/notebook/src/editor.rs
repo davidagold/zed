@@ -16,7 +16,7 @@ use std::{
     convert::AsRef,
     ops::Range,
 };
-use theme::{ActiveTheme, SyntaxTheme};
+use theme::ActiveTheme;
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
     SharedString, Styled, ViewContext, VisualContext,
@@ -214,7 +214,7 @@ impl NotebookEditor {
             .collect_vec()
     }
 
-    fn expand_cell_outputs(
+    fn get_cell_output_buffers(
         &mut self,
         cx: &mut ViewContext<Editor>,
         for_cell_ids: Option<Vec<CellId>>,
@@ -240,21 +240,21 @@ impl NotebookEditor {
                                 name,
                                 text,
                             } => match name {
-                                StreamOutputTarget::Stdout => ForOutput::print(Some(*text), cx),
-                                StreamOutputTarget::Stderr => ForOutput::print(None, cx),
+                                StreamOutputTarget::Stdout => ForOutput::print(Some(text.clone())),
+                                StreamOutputTarget::Stderr => ForOutput::print(None),
                             },
                             DisplayData {
                                 output_type,
                                 data,
                                 metadata,
-                            } => ForOutput::print(None, cx),
+                            } => ForOutput::print(None),
                             ExecutionResult {
                                 // TODO: Handle MIME types here
                                 output_type,
                                 execution_count,
                                 data,
                                 metadata,
-                            } => ForOutput::print(None, cx),
+                            } => ForOutput::print(None),
                         };
                         Some((cell.id.into(), output_action))
                     })
@@ -262,19 +262,28 @@ impl NotebookEditor {
             })
             .collect();
 
-        for (excerpt_id, action) in output_actions {
-            match action {
-                ForOutput::Print(Some((buffer, range))) => {
-                    let multi = self.editor.read(cx).buffer();
-                    multi.update(cx, |multi, cx| {
-                        //
-
-                        multi.insert_excerpts_after(excerpt_id, buffer, vec![range], cx)
-                    });
+        let buffers_by_range: Vec<(ExcerptId, ExcerptRange<usize>, Model<Buffer>)> = output_actions
+            .into_iter()
+            .flat_map(|(excerpt_id, action)| match action {
+                ForOutput::Print(Some(text)) => {
+                    let end = text.len();
+                    let range = ExcerptRange {
+                        context: 0..text.len(),
+                        primary: None,
+                    };
+                    let buffer = cx.new_model(|cx| Buffer::local(text, cx));
+                    Some((excerpt_id, range, buffer))
                 }
-                ForOutput::Print(None) => {}
-            }
-        }
+                ForOutput::Print(None) => None,
+            })
+            .collect();
+
+        // editor.buffer().update(cx, |multi, cx| {
+        //     //
+        //     for (excerpt_id, range, buffer) in buffers_by_range {
+        //         multi.insert_excerpts_after(excerpt_id, buffer, vec![range], cx);
+        //     }
+        // });
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {

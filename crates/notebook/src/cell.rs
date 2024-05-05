@@ -352,21 +352,13 @@ pub enum JupyterServerEvent {}
 
 #[derive(Clone, Debug)]
 pub enum ForOutput {
-    Print(Option<(Model<Buffer>, ExcerptRange<usize>)>),
+    Print(Option<String>),
 }
 
 impl ForOutput {
-    pub fn print<V>(text: Option<String>, cx: &ViewContext<V>) -> ForOutput {
+    pub fn print(text: Option<String>) -> ForOutput {
         match text {
-            Some(text) => {
-                let end = text.len();
-                let range = ExcerptRange {
-                    context: 0..text.len(),
-                    primary: None,
-                };
-                let buffer = cx.new_model(|cx| Buffer::local(text, cx));
-                ForOutput::Print(Some((buffer, range)))
-            }
+            Some(text) => ForOutput::Print(Some(text)),
             None => ForOutput::Print(None),
         }
     }
