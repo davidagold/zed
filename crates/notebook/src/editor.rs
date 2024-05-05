@@ -150,12 +150,10 @@ impl NotebookEditor {
         });
 
         self.editor.update(cx, |editor, cx| {
-            let syntax = cx.theme().syntax().as_ref().clone();
             let styles_by_range = NotebookEditor::get_highlight_styles_for_multi(
                 editor,
                 highlights_by_range,
                 &only_for_excerpt_ids,
-                &syntax,
                 cx,
             );
 
@@ -183,10 +181,11 @@ impl NotebookEditor {
         editor: &Editor,
         highlights_by_range: Vec<(Range<usize>, HighlightId)>,
         only_for_excerpt_ids: &Option<Vec<ExcerptId>>,
-        syntax: &SyntaxTheme,
         cx: &ViewContext<T>,
     ) -> Vec<(Range<multi_buffer::Anchor>, HighlightStyle)> {
         let multi = editor.buffer().read(cx);
+        let syntax = cx.theme().syntax().as_ref().clone();
+
         highlights_by_range
             .iter()
             .flat_map(|(range, h)| {
