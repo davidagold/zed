@@ -90,6 +90,7 @@ where
         A: de::MapAccess<'de>,
     {
         while let Some((key, val)) = map.next_entry()? {
+            // Work in a closure to propagate errors without returning early
             let result_parse_entry = (|| -> Result<(), A::Error> {
                 match key {
                     "metadata" => self.metadata = parse_value(val)?,
