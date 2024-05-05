@@ -1,16 +1,17 @@
+// use crate::common::python_lang;
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::{ExcerptId, ExcerptRange};
-use gpui::{AppContext, Flatten, Model, WeakModel};
-use language::{Buffer, File};
+use editor::ExcerptId;
+use futures::FutureExt;
+use gpui::{AppContext, AsyncAppContext, Flatten, Model, WeakModel};
+use language::{Buffer, File, Language};
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
+use serde_json::Value;
 use std::{any::Any, fmt::Debug, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::{Context, ViewContext};
-
-use crate::common::python_lang;
+use ui::Context;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -97,7 +98,7 @@ impl File for PhonyFile {
 impl CellBuilder {
     pub fn new(
         project_handle: &mut WeakModel<Project>,
-        cx: &mut AppContext,
+        cx: &mut AsyncAppContext,
         id: u64,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> CellBuilder {
@@ -120,7 +121,7 @@ impl CellBuilder {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
-                        let language = python_lang(cx);
+                        // let language = python_lang(cx);
                         let source_lines: Vec<String> = match val {
                             serde_json::Value::String(src) => Ok([src].into()),
                             serde_json::Value::Array(src_lines) => src_lines.into_iter().try_fold(
@@ -136,7 +137,7 @@ impl CellBuilder {
                                     Ok(source_lines)
                                 },
                             ),
-                            _ => Err(anyhow::anyhow!("Unexpected source format: {:#?}", val)),
+                            _ => Err(anyhow!("Unexpected source format: {:#?}", val)),
                         }?;
 
                         project_handle
@@ -144,7 +145,7 @@ impl CellBuilder {
                                 // TODO: Detect this from the file. Also, get it to work.
                                 let source_buffer = project.create_buffer(
                                     source_lines.join("\n").as_str(),
-                                    Some(language),
+                                    None,
                                     project_cx,
                                 )?;
 
@@ -158,8 +159,15 @@ impl CellBuilder {
                     }
                     "outputs" => {
                         // TODO: Validate `cell_type == 'code'`
-                        // let output: Vec<IpynbCodeOutput> = serde_json::from_value(val)?;
-                        this.outputs = serde_json::from_value(val).ok();
+                        // log::info!("Cell output value: {:#?}", val);
+                        // let output = val.as_array().ok_or_else(|| {
+                        //
+                        // anyhow!("Error parsing {:#?}", val)
+                        // })?;
+                        // log::info!("`output` = {:#?}", output);
+                        let outputs = serde_json::from_value::<Vec<IpynbCodeOutput>>(val);
+                        // log::info!("Parsed cell output as: {:#?}", outputs);
+                        this.outputs = outputs.ok();
                     }
                     _ => {}
                 };
@@ -195,7 +203,7 @@ impl CellBuilder {
     }
 
     pub fn build(self) -> Cell {
-        Cell {
+        let cell = Cell {
             id: CellId(self.id),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
@@ -203,7 +211,9 @@ impl CellBuilder {
             source: self.source.unwrap(),
             execution_count: self.execution_count,
             outputs: self.outputs,
-        }
+        };
+
+        cell
     }
 }
 
@@ -313,20 +323,21 @@ impl Summary for CellSummary {
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
 // TODO: Better typing for `output_type`
 #[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "output_type")]
 pub enum IpynbCodeOutput {
+    #[serde(alias = "stream")]
     Stream {
-        output_type: String,
         name: StreamOutputTarget,
         // text: Rope,
         text: String,
     },
+    #[serde(alias = "display_data")]
     DisplayData {
-        output_type: String,
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
     },
+    #[serde(alias = "execute_result")]
     ExecutionResult {
-        output_type: String,
         execution_count: usize,
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
@@ -363,3 +374,36 @@ impl ForOutput {
         }
     }
 }
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct KernelSpec {
+    pub argv: Option<Vec<String>>,
+    pub display_name: String,
+    pub language: String,
+    pub interrup_mode: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub metadata: Option<HashMap<String, Value>>,
+}
+
+// #[derive(Clone, Debug, Deserialize)]
+// enum KernelLanguage {
+//     Python { version }
+// }
+
+// "kernelspec": {
+//  "display_name": "notebooks-C37d9m95",
+//  "language": "python",
+//  "name": "python3"
+// },
+// "language_info": {
+//  "codemirror_mode": {
+//   "name": "ipython",
+//   "version": 3
+//  },
+//  "file_extension": ".py",
+//  "mimetype": "text/x-python",
+//  "name": "python",
+//  "nbconvert_exporter": "python",
+//  "pygments_lexer": "ipython3",
+//  "version": "3.11.7"
+// }

@@ -80,16 +80,15 @@ impl NotebookEditor {
                 );
 
                 // TODO: Do something with `maybe_output`
-                //             let output_buffers_by_range =
                 let output_buffers =
                     NotebookEditor::get_cell_output_buffers(&cells, &mut multi, None, model_cx);
                 for output in output_buffers {
                     log::info!("{:#?}", output);
                 }
             }
+
             multi
         });
-        log::info!("{:#?}", multi.read(cx).snapshot(cx).text());
 
         let editor = cx.new_view(|cx| {
             let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
@@ -116,7 +115,12 @@ impl NotebookEditor {
 
         cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
             cx.emit(event.clone());
-            log::info!("Event: {:#?}", event);
+            match event {
+                EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                _ => {
+                    log::info!("Event: {:#?}", event);
+                }
+            }
         })
         .detach();
 
@@ -128,101 +132,6 @@ impl NotebookEditor {
         };
 
         this
-    }
-
-    fn highlight_syntax(
-        &mut self,
-        only_for_excerpt_ids: Option<Vec<ExcerptId>>,
-        cx: &mut ViewContext<NotebookEditor>,
-    ) {
-        let mut highlights_by_range = Vec::<(Range<usize>, HighlightId)>::default();
-
-        self.editor.update(cx, |editor, cx| {
-            editor.buffer().read_with(cx, |multi, cx| {
-                // This is somewhat inefficient but OK for now.
-                multi.for_each_buffer(|buffer_handle| {
-                    if only_for_excerpt_ids.is_some()
-                        && (!only_for_excerpt_ids.as_ref().unwrap().iter().any(|id| {
-                            multi
-                                .excerpts_for_buffer(buffer_handle, cx)
-                                .iter()
-                                .map(|(id, _)| id)
-                                .contains(id)
-                        }))
-                    {
-                        return;
-                    }
-                    buffer_handle.read_with(cx, |buffer, cx| {
-                        highlights_by_range.extend(self.get_highlight_ids_for_buffer(buffer, cx)?);
-                        Some(())
-                    });
-                });
-            });
-        });
-
-        self.editor.update(cx, |editor, cx| {
-            let styles_by_range = NotebookEditor::get_highlight_styles_for_multi(
-                editor,
-                highlights_by_range,
-                &only_for_excerpt_ids,
-                cx,
-            );
-
-            for (rng, style) in styles_by_range {
-                editor.highlight_text::<NotebookEditor>(vec![rng], style, cx);
-            }
-        });
-    }
-
-    fn get_highlight_ids_for_buffer(
-        &self,
-        buffer: &Buffer,
-        cx: &AppContext,
-    ) -> Option<Vec<(Range<usize>, HighlightId)>> {
-        let lang = self.notebook.read(cx).language.clone()?;
-        let highlights_by_range = lang
-            .highlight_text(buffer.as_rope(), 0..buffer.len())
-            .into_iter()
-            .collect_vec();
-
-        Some(highlights_by_range)
-    }
-
-    fn get_highlight_styles_for_multi<T>(
-        editor: &Editor,
-        highlights_by_range: Vec<(Range<usize>, HighlightId)>,
-        only_for_excerpt_ids: &Option<Vec<ExcerptId>>,
-        cx: &ViewContext<T>,
-    ) -> Vec<(Range<multi_buffer::Anchor>, HighlightStyle)> {
-        let multi = editor.buffer().read(cx);
-        let syntax = cx.theme().syntax().as_ref().clone();
-
-        highlights_by_range
-            .iter()
-            .flat_map(|(range, h)| {
-                multi
-                    .range_to_buffer_ranges(range.clone(), cx)
-                    .iter()
-                    .filter_map(|(_buffer, range, excerpt_id)| {
-                        if only_for_excerpt_ids.is_some()
-                            && (!only_for_excerpt_ids
-                                .as_ref()
-                                .unwrap()
-                                .iter()
-                                .any(|id| id == excerpt_id))
-                        {
-                            return None;
-                        }
-                        let range = Range {
-                            start: multi.snapshot(cx).anchor_before(range.start),
-                            end: multi.snapshot(cx).anchor_before(range.end),
-                        };
-                        let style = h.style(&syntax)?;
-                        Some((range, style))
-                    })
-                    .collect_vec()
-            })
-            .collect_vec()
     }
 
     fn get_cell_output_buffers(
@@ -242,11 +151,7 @@ impl NotebookEditor {
                     .map(|output| {
                         use IpynbCodeOutput::*;
                         let output_action = match output {
-                            Stream {
-                                output_type,
-                                name,
-                                text,
-                            } => {
+                            Stream { name, text } => {
                                 log::info!("Output text: {:#?}", text);
                                 match name {
                                     StreamOutputTarget::Stdout => {
@@ -255,14 +160,9 @@ impl NotebookEditor {
                                     StreamOutputTarget::Stderr => ForOutput::print(None),
                                 }
                             }
-                            DisplayData {
-                                output_type,
-                                data,
-                                metadata,
-                            } => ForOutput::print(None),
+                            DisplayData { data, metadata } => ForOutput::print(None),
                             ExecutionResult {
                                 // TODO: Handle MIME types here
-                                output_type,
                                 execution_count,
                                 data,
                                 metadata,
@@ -419,7 +319,7 @@ impl Render for NotebookEditor {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.editor.clone())
-            .on_action(cx.listener(NotebookEditor::run_current_cell))
+        // .on_action(cx.listener(NotebookEditor::run_current_cell))
     }
 }
 
@@ -434,9 +334,7 @@ impl workspace::item::ProjectItem for NotebookEditor {
     where
         Self: Sized,
     {
-        let mut nb_editor = NotebookEditor::new(project, notebook, cx);
-        nb_editor.highlight_syntax(None, cx);
-        nb_editor
+        NotebookEditor::new(project, notebook, cx)
     }
 }
 

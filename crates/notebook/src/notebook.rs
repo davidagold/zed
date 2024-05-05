@@ -3,17 +3,19 @@ pub mod cell;
 mod common;
 pub mod editor;
 
-use crate::cell::{CellId, Cells, ForOutput};
-use crate::common::{parse_value, python_lang};
+use crate::cell::{Cells, KernelSpec};
+use crate::common::parse_value;
+use anyhow::anyhow;
 use cell::CellBuilder;
 use collections::HashMap;
-use gpui::{Context, ModelContext, WeakModel};
+use gpui::{AsyncAppContext, Context, WeakModel};
 use language::Language;
 use log::{error, info};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
+use serde_json::Value;
 use std::{io::Read, num::NonZeroU64, sync::Arc};
 
-use project::{self, ProjectPath};
+use project::{self, Project, ProjectPath};
 use worktree::File;
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#top-level-structure
@@ -21,18 +23,75 @@ use worktree::File;
 pub struct Notebook {
     file: Option<Arc<dyn language::File>>,
     language: Option<Arc<Language>>,
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    pub metadata: Option<HashMap<String, Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     pub nbformat: usize,
     pub nbformat_minor: usize,
     pub cells: Cells,
 }
 
-struct NotebookBuilder<'nbb, 'cx: 'nbb> {
+impl Notebook {
+    fn kernel_spec(&self) -> Option<KernelSpec> {
+        self.metadata.clone().and_then(|metadata| {
+            Some(serde_json::from_value(metadata.get("kernel_spec")?.clone()).ok()?)
+        })
+    }
+
+    async fn try_set_language<'cx>(
+        &mut self,
+        project: &WeakModel<Project>,
+        cx: &mut AsyncAppContext,
+    ) -> anyhow::Result<Option<Arc<Language>>> {
+        let Some(kernel_spec) = (&self.metadata).as_ref().and_then(|metadata| {
+            log::info!("NotebookBuilder.metadata: {:#?}", metadata);
+            serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
+        }) else {
+            return Err(anyhow::anyhow!("No kernel spec"));
+        };
+
+        log::info!("kernel_spec: {:#?}", kernel_spec);
+
+        let cloned_project = project.clone();
+        let language = cx
+            .spawn(|cx| async move {
+                let language = match kernel_spec.language.as_str() {
+                    "python" => cloned_project.read_with(&cx, |project, cx| {
+                        let languages = project.languages();
+                        log::info!("Available languages: {:#?}", languages.language_names());
+
+                        languages.language_for_name("Python")
+                    }),
+                    _ => Err(anyhow::anyhow!("Failed to get language")),
+                }?
+                .await;
+
+                language
+            })
+            .await;
+
+        self.language = language.ok();
+        match &self.language {
+            Some(lang) => {
+                let handle = &project
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("Cannot upgrade project"))?;
+                cx.update_model(handle, |project, cx| {
+                    for cell in self.cells.iter() {
+                        log::info!("Setting language {:#?} for buffer {:#?}", lang, cell.source);
+                        project.set_language_for_buffer(&cell.source, lang.clone(), cx)
+                    }
+                })?;
+                Ok(Some(lang.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+struct NotebookBuilder<'cx> {
     project_handle: WeakModel<project::Project>,
     file: Option<Arc<dyn language::File>>,
-    language: Option<Arc<Language>>,
-    cx: &'nbb mut ModelContext<'cx, Notebook>,
+    cx: &'cx mut AsyncAppContext,
     metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: Option<usize>,
@@ -40,17 +99,15 @@ struct NotebookBuilder<'nbb, 'cx: 'nbb> {
     cells: Cells,
 }
 
-impl<'nbb, 'cx: 'nbb> NotebookBuilder<'nbb, 'cx> {
+impl<'cx> NotebookBuilder<'cx> {
     fn new(
         project_handle: WeakModel<project::Project>,
         file: Option<Arc<dyn language::File>>,
-        language: Option<Arc<Language>>,
-        cx: &'nbb mut ModelContext<'cx, Notebook>,
-    ) -> NotebookBuilder<'nbb, 'cx> {
+        cx: &'cx mut AsyncAppContext,
+    ) -> NotebookBuilder<'cx> {
         NotebookBuilder {
             project_handle,
             file,
-            language,
             cx,
             metadata: None,
             nbformat: None,
@@ -59,24 +116,26 @@ impl<'nbb, 'cx: 'nbb> NotebookBuilder<'nbb, 'cx> {
         }
     }
 
-    fn build(self) -> Notebook {
-        Notebook {
+    async fn build(mut self) -> Notebook {
+        let mut notebook = Notebook {
             file: self.file,
-            language: self.language,
+            language: None,
             metadata: self.metadata,
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
             cells: self.cells,
-        }
+        };
+        notebook
+            .try_set_language(&self.project_handle, &mut self.cx)
+            .await;
+
+        notebook
     }
 }
 
-impl<'nbb, 'cx, 'de> Visitor<'de> for NotebookBuilder<'nbb, 'cx>
-where
-    'cx: 'nbb,
-    'nbb: 'de,
-{
-    type Value = NotebookBuilder<'nbb, 'cx>;
+// impl<'nbb, 'cx, 'de> Visitor<'de> for NotebookBuilder<'nbb, 'cx>
+impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
+    type Value = NotebookBuilder<'cx>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -108,7 +167,8 @@ where
                             let cell_builder =
                                 CellBuilder::new(&mut self.project_handle, &mut self.cx, id, item);
 
-                            self.cells.push_cell(cell_builder.build(), &());
+                            self.cells.push_cell(cell_builder.build(), &())
+                            // self.cell_builders.push(cell_builder);
                         }
                     }
                     _ => {}
@@ -130,12 +190,8 @@ where
     }
 }
 
-impl<'nbb, 'cx, 'de> DeserializeSeed<'de> for NotebookBuilder<'nbb, 'cx>
-where
-    'cx: 'nbb,
-    'nbb: 'de,
-{
-    type Value = NotebookBuilder<'nbb, 'cx>;
+impl<'cx, 'de: 'cx> DeserializeSeed<'de> for NotebookBuilder<'cx> {
+    type Value = NotebookBuilder<'cx>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
@@ -162,44 +218,47 @@ impl project::Item for Notebook {
         }
         info!("Detected `.ipynb` extension for path `{:#?}`", path);
 
-        let language = python_lang(app_cx);
-
-        project_handle.update(app_cx, |project, cx| {
-            let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
-                return;
-            };
-            project.start_language_servers(&worktree, language.clone(), cx);
-        });
-
         let project = project_handle.downgrade();
-        let open_buffer_task =
-            project.update(app_cx, |project, cx| project.open_buffer(path.clone(), cx));
+        let cloned_path = path.clone();
 
         let task = app_cx.spawn(|mut cx| async move {
-            let buffer_handle = open_buffer_task?.await?;
-
+            let buffer_handle = project
+                .update(&mut cx, |project, cx| {
+                    project.open_buffer(cloned_path.clone(), cx)
+                })
+                .ok()
+                .ok_or_else(|| anyhow::anyhow!("Failed to open file"))?
+                .await?;
             info!("Successfully opened buffer");
 
-            cx.new_model(move |cx_model| {
-                let buffer = buffer_handle.read(cx_model);
-                let mut bytes = Vec::<u8>::with_capacity(buffer.len());
+            let project_clone = project.clone();
 
+            let Ok(Some((bytes, file))) = buffer_handle.read_with(&cx, |buffer, cx| {
+                let mut bytes = Vec::<u8>::with_capacity(buffer.len());
                 let n_bytes_maybe_read = buffer
                     .bytes_in_range(0..buffer.len())
                     .read_to_end(&mut bytes);
 
-                match n_bytes_maybe_read {
-                    Ok(n_bytes) => info!("Successfully read {} bytes from notebook file", n_bytes),
-                    Err(err) => error!("Failed to read from notebook file: {:#?}", err),
-                }
+                let n_bytes_read = n_bytes_maybe_read.ok()?;
+                info!(
+                    "Successfully read {} bytes from notebook file",
+                    n_bytes_read
+                );
 
                 let file = buffer.file().map(|file| file.clone());
-                let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-                NotebookBuilder::new(project, file, Some(language), cx_model)
-                    .deserialize(&mut deserializer)
-                    .map(|builder| builder.build())
-                    .unwrap_or_default()
-            })
+                Some((bytes, file))
+            }) else {
+                return Err(anyhow!("Failed to read from notebook file"));
+            };
+
+            let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+            let builder = NotebookBuilder::new(project_clone, file, &mut cx)
+                .deserialize(&mut deserializer)
+                .map_err(|err| anyhow!(err.to_string()))?;
+            // .await
+            let notebook = builder.build().await;
+
+            cx.new_model(move |cx_model| notebook)
         });
 
         Some(task)
