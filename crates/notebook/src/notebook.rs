@@ -133,7 +133,6 @@ impl<'cx> NotebookBuilder<'cx> {
     }
 }
 
-// impl<'nbb, 'cx, 'de> Visitor<'de> for NotebookBuilder<'nbb, 'cx>
 impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
     type Value = NotebookBuilder<'cx>;
 
@@ -168,7 +167,6 @@ impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
                                 CellBuilder::new(&mut self.project_handle, &mut self.cx, id, item);
 
                             self.cells.push_cell(cell_builder.build(), &())
-                            // self.cell_builders.push(cell_builder);
                         }
                     }
                     _ => {}

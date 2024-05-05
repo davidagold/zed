@@ -5,18 +5,17 @@ use editor::{
     MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, HighlightStyle, Model,
-    ModelContext, ParentElement, Subscription, View,
+    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ModelContext,
+    ParentElement, Subscription, View,
 };
 use itertools::Itertools;
-use language::{self, Buffer, Capability, HighlightId};
+use language::{self, Buffer, Capability};
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
     ops::Range,
 };
-use theme::ActiveTheme;
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
     SharedString, Styled, ViewContext, VisualContext,
@@ -190,9 +189,6 @@ impl NotebookEditor {
             .collect();
 
         buffers_by_range
-        // for (excerpt_id, range, buffer) in buffers_by_range {
-        //     multi.insert_excerpts_after(excerpt_id, buffer, vec![range], cx);
-        // }
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {

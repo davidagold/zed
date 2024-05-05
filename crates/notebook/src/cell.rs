@@ -2,9 +2,8 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use editor::ExcerptId;
-use futures::FutureExt;
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, WeakModel};
-use language::{Buffer, File, Language};
+use language::{Buffer, File};
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
@@ -321,14 +320,12 @@ impl Summary for CellSummary {
 }
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
-// TODO: Better typing for `output_type`
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "output_type")]
 pub enum IpynbCodeOutput {
     #[serde(alias = "stream")]
     Stream {
         name: StreamOutputTarget,
-        // text: Rope,
         text: String,
     },
     #[serde(alias = "display_data")]
@@ -384,26 +381,3 @@ pub struct KernelSpec {
     pub env: Option<HashMap<String, String>>,
     pub metadata: Option<HashMap<String, Value>>,
 }
-
-// #[derive(Clone, Debug, Deserialize)]
-// enum KernelLanguage {
-//     Python { version }
-// }
-
-// "kernelspec": {
-//  "display_name": "notebooks-C37d9m95",
-//  "language": "python",
-//  "name": "python3"
-// },
-// "language_info": {
-//  "codemirror_mode": {
-//   "name": "ipython",
-//   "version": 3
-//  },
-//  "file_extension": ".py",
-//  "mimetype": "text/x-python",
-//  "name": "python",
-//  "nbconvert_exporter": "python",
-//  "pygments_lexer": "ipython3",
-//  "version": "3.11.7"
-// }
