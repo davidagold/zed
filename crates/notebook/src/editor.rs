@@ -175,13 +175,13 @@ impl NotebookEditor {
                     multi
                         .range_to_buffer_ranges(rng.clone(), cx)
                         .iter()
-                        .filter_map(|(_buf, range, except_id)| {
+                        .filter_map(|(_buf, range, excerpt_id)| {
                             if only_for_excerpt_ids.is_some()
                                 && (!only_for_excerpt_ids
                                     .as_ref()
                                     .unwrap()
                                     .iter()
-                                    .any(|id| id == except_id))
+                                    .any(|id| id == excerpt_id))
                             {
                                 return None;
                             }
