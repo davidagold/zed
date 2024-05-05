@@ -1,15 +1,14 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::ExcerptId;
+use editor::{ExcerptId, ExcerptRange};
 use gpui::{AppContext, Flatten, Model, WeakModel};
 use language::{Buffer, File};
-
 use project::Project;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use std::{any::Any, fmt::Debug, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::Context;
+use ui::{Context, ViewContext};
 
 use crate::common::python_lang;
 
@@ -19,10 +18,10 @@ pub struct Cell {
     // `cell_id` is a notebook field
     cell_id: Option<String>,
     cell_type: CellType,
-    metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
-    execution_count: Option<usize>,
-    outputs: Option<Vec<IpynbCodeOutput>>,
+    pub execution_count: Option<usize>,
+    pub outputs: Option<Vec<IpynbCodeOutput>>,
 }
 
 pub struct CellBuilder {
@@ -143,7 +142,6 @@ impl CellBuilder {
                         project_handle
                             .update(cx, |project, project_cx| -> Result<()> {
                                 // TODO: Detect this from the file. Also, get it to work.
-
                                 let source_buffer = project.create_buffer(
                                     source_lines.join("\n").as_str(),
                                     Some(language),
@@ -151,7 +149,6 @@ impl CellBuilder {
                                 )?;
 
                                 this.source.replace(source_buffer);
-
                                 Ok(())
                             })
                             .flatten()?;
@@ -160,8 +157,11 @@ impl CellBuilder {
                         this.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
                     "outputs" => {
-                        // Nooooooo
+                        // TODO: Validate `cell_type == 'code'`
+                        // let output: Vec<IpynbCodeOutput> = serde_json::from_value(val)?;
+                        this.outputs = serde_json::from_value(val).ok();
                     }
+                    _ => {}
                 };
 
                 let title_text = format!("Cell {:#?}", id);
@@ -312,7 +312,7 @@ impl Summary for CellSummary {
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
 // TODO: Better typing for `output_type`
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum IpynbCodeOutput {
     Stream {
         output_type: String,
@@ -334,7 +334,7 @@ pub enum IpynbCodeOutput {
 }
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum MimeData {
     MultiLineText(Vec<String>),
     B64EncodedMultiLineText(Vec<String>),
@@ -342,7 +342,7 @@ pub enum MimeData {
 }
 
 // TODO: Appropriate deserialize from string value
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum StreamOutputTarget {
     Stdout,
     Stderr,
@@ -350,15 +350,24 @@ pub enum StreamOutputTarget {
 
 pub enum JupyterServerEvent {}
 
+#[derive(Clone, Debug)]
 pub enum ForOutput {
-    Print(String),
+    Print(Option<(Model<Buffer>, ExcerptRange<usize>)>),
 }
 
 impl ForOutput {
-    pub fn print(text: Option<String>) -> ForOutput {
+    pub fn print<V>(text: Option<String>, cx: &ViewContext<V>) -> ForOutput {
         match text {
-            Some(text) => ForOutput::Print(text),
-            None => ForOutput::Print("".into()),
+            Some(text) => {
+                let end = text.len();
+                let range = ExcerptRange {
+                    context: 0..text.len(),
+                    primary: None,
+                };
+                let buffer = cx.new_model(|cx| Buffer::local(text, cx));
+                ForOutput::Print(Some((buffer, range)))
+            }
+            None => ForOutput::Print(None),
         }
     }
 }

@@ -3,7 +3,7 @@ pub mod cell;
 mod common;
 pub mod editor;
 
-use crate::cell::{CellId, Cells};
+use crate::cell::{CellId, Cells, ForOutput};
 use crate::common::{parse_value, python_lang};
 use cell::CellBuilder;
 use collections::HashMap;
@@ -21,11 +21,11 @@ use worktree::File;
 pub struct Notebook {
     file: Option<Arc<dyn language::File>>,
     language: Option<Arc<Language>>,
-    metadata: Option<HashMap<String, serde_json::Value>>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
-    nbformat: usize,
-    nbformat_minor: usize,
-    cells: Cells,
+    pub nbformat: usize,
+    pub nbformat_minor: usize,
+    pub cells: Cells,
 }
 
 struct NotebookBuilder<'nbb, 'cx: 'nbb> {

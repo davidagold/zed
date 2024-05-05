@@ -27,7 +27,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellId, ForOutput, IpynbCodeOutput, Output, StreamOutputTarget},
+    cell::{Cell, CellId, ForOutput, IpynbCodeOutput, StreamOutputTarget},
     Notebook,
 };
 
@@ -214,39 +214,67 @@ impl NotebookEditor {
             .collect_vec()
     }
 
-    fn expand_cell_outputs(&mut self, cx: &mut ViewContext<Editor>) {
+    fn expand_cell_outputs(
+        &mut self,
+        cx: &mut ViewContext<Editor>,
+        for_cell_ids: Option<Vec<CellId>>,
+    ) {
         let editor = self.editor.read(cx);
 
-        let outputs: Vec<Output> = self.notebook.read(cx).cells.iter().flat_map(|cell| {
-            let Some(outputs) = &cell.outputs else {
-                return None;
-            };
-            outputs.iter().filter_map(|output| {
-                use IpynbCodeOutput::*;
-                match output {
-                    Stream {
-                        output_type,
-                        name,
-                        text,
-                    } => match name {
-                        StreamOutputTarget::Stdout => ForOutput::print(Some(text)),
-                        StreamOutputTarget::Stderr => ForOutput::print(None),
-                    },
-                    DisplayData {
-                        output_type,
-                        data,
-                        metadata,
-                    } => ForOutput::print(None),
-                    ExecutionResult {
-                        // TODO: Handle MIME types here
-                        output_type,
-                        execution_count,
-                        data,
-                        metadata,
-                    } => ForOutput::print(None),
+        let output_actions: Vec<(ExcerptId, ForOutput)> = self
+            .notebook
+            .read(cx)
+            .cells
+            .iter()
+            .flat_map(|cell| -> Vec<(ExcerptId, ForOutput)> {
+                let Some(outputs) = &cell.outputs else {
+                    return Vec::new();
                 };
+                outputs
+                    .into_iter()
+                    .filter_map(|output| {
+                        use IpynbCodeOutput::*;
+                        let output_action = match output {
+                            Stream {
+                                output_type,
+                                name,
+                                text,
+                            } => match name {
+                                StreamOutputTarget::Stdout => ForOutput::print(Some(*text), cx),
+                                StreamOutputTarget::Stderr => ForOutput::print(None, cx),
+                            },
+                            DisplayData {
+                                output_type,
+                                data,
+                                metadata,
+                            } => ForOutput::print(None, cx),
+                            ExecutionResult {
+                                // TODO: Handle MIME types here
+                                output_type,
+                                execution_count,
+                                data,
+                                metadata,
+                            } => ForOutput::print(None, cx),
+                        };
+                        Some((cell.id.into(), output_action))
+                    })
+                    .collect()
             })
-        });
+            .collect();
+
+        for (excerpt_id, action) in output_actions {
+            match action {
+                ForOutput::Print(Some((buffer, range))) => {
+                    let multi = self.editor.read(cx).buffer();
+                    multi.update(cx, |multi, cx| {
+                        //
+
+                        multi.insert_excerpts_after(excerpt_id, buffer, vec![range], cx)
+                    });
+                }
+                ForOutput::Print(None) => {}
+            }
+        }
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
