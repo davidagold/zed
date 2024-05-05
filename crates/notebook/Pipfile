@@ -6,14 +6,10 @@ name = "pypi"
 [packages]
 jupyter-server = "*"
 jupyter-client = "*"
-nbclient = "*"
-ipykernel = "*"
-ruff = "*"
 pydantic = "*"
-pendulum = "*"
-rich = "*"
 
 [dev-packages]
+rich = "*"
 
 [requires]
 python_version = "3.11"
