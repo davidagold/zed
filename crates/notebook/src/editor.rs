@@ -4,21 +4,23 @@ use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptRange, MultiBuffer, MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AnyView, AppContext, Context, Entity, EventEmitter, FocusHandle, FocusableView, Model,
-    ParentElement, Subscription, View,
+    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    Subscription, View,
 };
 use itertools::Itertools;
-use language::{self, Capability};
+use language::{self, Capability, HighlightId};
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
     ops::Range,
 };
+use theme::ActiveTheme;
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
-    SharedString, Styled, StyledTypography, ViewContext, VisualContext,
+    SharedString, Styled, ViewContext, VisualContext,
 };
+
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
@@ -65,17 +67,31 @@ impl NotebookEditor {
             editor
         });
 
+        let focus_handle = cx.focus_handle();
+
+        cx.on_focus_in(&focus_handle, |this, cx| {
+            if this.focus_handle(cx).is_focused(cx) {
+                this.editor.focus_handle(cx).focus(cx)
+            }
+        })
+        .detach();
+
+        // cx.on_focus_out(&focus_handle, |this, cx| {
+        //     //
+        // })
+        // .detach();
+
         let subscription = cx.subscribe(&project, |this, project, event, cx| {
+            // cx.emit(event.clone());
             log::info!("Event: {:#?}", event);
         });
 
         cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
             cx.emit(event.clone());
+            log::info!("Event: {:#?}", event);
+            // this.editor.focus_handle(cx).focus(cx);
         })
         .detach();
-
-        let focus_handle = cx.focus_handle();
-        // cx.on_focus_in(&focus_handle, |this, cx| {}).detach();
 
         let this = NotebookEditor {
             notebook,
@@ -200,17 +216,65 @@ impl EventEmitter<EditorEvent> for NotebookEditor {}
 
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-        self.focus_handle.clone()
-        // self.editor.focus_handle(cx).clone()
+        // self.focus_handle.clone()
+        self.editor.focus_handle(cx).clone()
     }
 }
 
 impl Render for NotebookEditor {
     fn render(&mut self, cx: &mut ui::prelude::ViewContext<Self>) -> impl ui::prelude::IntoElement {
+        let mut highlights_by_range = Vec::<(Range<usize>, HighlightId)>::default();
+        let syntax = cx.theme().syntax().as_ref().clone();
         let child = self.editor.clone();
 
+        child.update(cx, |editor, cx| {
+            editor.buffer().read_with(cx, |multi, cx| {
+                multi.for_each_buffer(|buffer| {
+                    buffer.read_with(cx, |buf, cx| {
+                        let maybe_lang = self.notebook.read(cx).language.clone();
+                        highlights_by_range.extend(
+                            maybe_lang?
+                                .highlight_text(buf.as_rope(), 0..buf.len())
+                                .into_iter()
+                                .collect_vec()
+                                .into_iter(),
+                        );
+                        Some(())
+                    });
+                });
+            });
+        });
+
+        self.editor.update(cx, |editor, cx| {
+            let styles_by_range = editor.buffer().read_with(cx, |multi, cx| {
+                highlights_by_range
+                    .iter()
+                    .flat_map(|(rng, h)| {
+                        multi
+                            .range_to_buffer_ranges(rng.clone(), cx)
+                            .iter()
+                            .filter_map(|(buf, range, except_id)| {
+                                let rng = Range {
+                                    start: multi.snapshot(cx).anchor_before(range.start),
+                                    end: multi.snapshot(cx).anchor_before(range.end),
+                                };
+                                match h.style(&syntax) {
+                                    Some(style) => Some((rng, style)),
+                                    None => None,
+                                }
+                            })
+                            .collect_vec()
+                    })
+                    .collect_vec()
+            });
+
+            for (rng, style) in styles_by_range {
+                editor.highlight_text::<NotebookEditor>(vec![rng], style, cx);
+            }
+        });
+
         div()
-            .track_focus(&self.editor.focus_handle(cx))
+            .track_focus(&self.focus_handle)
             .size_full()
             .child(child)
             .on_action(cx.listener(NotebookEditor::run_current_cell))

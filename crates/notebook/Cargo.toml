@@ -26,6 +26,7 @@ languages.workspace = true
 log.workspace = true
 multi_buffer.workspace = true
 project.workspace = true
+regex.workspace = true
 rope.workspace = true
 rpc.workspace = true
 runtimelib = { git = "https://github.com/runtimed/runtimed", version = "0.1.0" }
@@ -37,6 +38,7 @@ serde_json.workspace = true
 settings.workspace = true
 sum_tree.workspace = true
 text.workspace = true
+theme.workspace = true
 tokio = { version = "1.36.0", features = ["full"] }
 tree-sitter-python = { workspace = true }
 tree-sitter.workspace = true
