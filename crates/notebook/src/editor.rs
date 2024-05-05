@@ -319,7 +319,7 @@ impl Render for NotebookEditor {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.editor.clone())
-        // .on_action(cx.listener(NotebookEditor::run_current_cell))
+            .on_action(cx.listener(NotebookEditor::run_current_cell))
     }
 }
 
