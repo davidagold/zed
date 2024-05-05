@@ -22,6 +22,7 @@ pub struct Cell {
     metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
     execution_count: Option<usize>,
+    outputs: Option<Vec<IpynbCodeOutput>>,
 }
 
 pub struct CellBuilder {
@@ -31,6 +32,7 @@ pub struct CellBuilder {
     metadata: Option<HashMap<String, serde_json::Value>>,
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
+    outputs: Option<Vec<IpynbCodeOutput>>,
 }
 
 impl Debug for CellBuilder {
@@ -107,6 +109,7 @@ impl CellBuilder {
             metadata: None,
             source: None,
             execution_count: None,
+            outputs: None,
         };
 
         for (key, val) in map {
@@ -156,7 +159,9 @@ impl CellBuilder {
                     "execution_count" => {
                         this.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
-                    _ => {}
+                    "outputs" => {
+                        // Nooooooo
+                    }
                 };
 
                 let title_text = format!("Cell {:#?}", id);
@@ -197,6 +202,7 @@ impl CellBuilder {
             metadata: self.metadata.unwrap(),
             source: self.source.unwrap(),
             execution_count: self.execution_count,
+            outputs: self.outputs,
         }
     }
 }
@@ -307,7 +313,7 @@ impl Summary for CellSummary {
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
 // TODO: Better typing for `output_type`
 #[derive(Deserialize)]
-enum IpynbCodeOutput {
+pub enum IpynbCodeOutput {
     Stream {
         output_type: String,
         name: StreamOutputTarget,
@@ -342,4 +348,17 @@ pub enum StreamOutputTarget {
     Stderr,
 }
 
-enum JupyterServerEvent {}
+pub enum JupyterServerEvent {}
+
+pub enum ForOutput {
+    Print(String),
+}
+
+impl ForOutput {
+    pub fn print(text: Option<String>) -> ForOutput {
+        match text {
+            Some(text) => ForOutput::Print(text),
+            None => ForOutput::Print("".into()),
+        }
+    }
+}

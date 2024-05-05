@@ -27,7 +27,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellId},
+    cell::{Cell, CellId, ForOutput, IpynbCodeOutput, Output, StreamOutputTarget},
     Notebook,
 };
 
@@ -214,7 +214,40 @@ impl NotebookEditor {
             .collect_vec()
     }
 
-    fn expand_output_cells<V>(&mut self, cx: &mut ViewContext<V>) {}
+    fn expand_cell_outputs(&mut self, cx: &mut ViewContext<Editor>) {
+        let editor = self.editor.read(cx);
+
+        let outputs: Vec<Output> = self.notebook.read(cx).cells.iter().flat_map(|cell| {
+            let Some(outputs) = &cell.outputs else {
+                return None;
+            };
+            outputs.iter().filter_map(|output| {
+                use IpynbCodeOutput::*;
+                match output {
+                    Stream {
+                        output_type,
+                        name,
+                        text,
+                    } => match name {
+                        StreamOutputTarget::Stdout => ForOutput::print(Some(text)),
+                        StreamOutputTarget::Stderr => ForOutput::print(None),
+                    },
+                    DisplayData {
+                        output_type,
+                        data,
+                        metadata,
+                    } => ForOutput::print(None),
+                    ExecutionResult {
+                        // TODO: Handle MIME types here
+                        output_type,
+                        execution_count,
+                        data,
+                        metadata,
+                    } => ForOutput::print(None),
+                };
+            })
+        });
+    }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
         let (excerpt_id, buffer_handle, _range) = match self.editor.read(cx).active_excerpt(cx) {
