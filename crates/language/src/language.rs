@@ -1270,7 +1270,6 @@ impl Language {
             let tree = grammar.parse_text(text, None);
             let captures =
                 SyntaxSnapshot::single_tree_captures(range.clone(), text, &tree, self, |grammar| {
-                    log::info!("Did capture");
                     grammar.highlights_query.as_ref()
                 });
             let highlight_maps = vec![grammar.highlight_map()];
