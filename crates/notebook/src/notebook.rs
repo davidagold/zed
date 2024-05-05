@@ -8,8 +8,7 @@ use crate::common::{parse_value, python_lang};
 use cell::CellBuilder;
 use collections::HashMap;
 use gpui::{Context, ModelContext, WeakModel};
-use itertools::Itertools;
-use language::LanguageServerName;
+use language::Language;
 use log::{error, info};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use std::{io::Read, num::NonZeroU64, sync::Arc};
@@ -21,6 +20,7 @@ use worktree::File;
 #[derive(Default)]
 pub struct Notebook {
     file: Option<Arc<dyn language::File>>,
+    language: Option<Arc<Language>>,
     metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: usize,
@@ -31,6 +31,7 @@ pub struct Notebook {
 struct NotebookBuilder<'nbb, 'cx: 'nbb> {
     project_handle: WeakModel<project::Project>,
     file: Option<Arc<dyn language::File>>,
+    language: Option<Arc<Language>>,
     cx: &'nbb mut ModelContext<'cx, Notebook>,
     metadata: Option<HashMap<String, serde_json::Value>>,
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
@@ -43,11 +44,13 @@ impl<'nbb, 'cx: 'nbb> NotebookBuilder<'nbb, 'cx> {
     fn new(
         project_handle: WeakModel<project::Project>,
         file: Option<Arc<dyn language::File>>,
+        language: Option<Arc<Language>>,
         cx: &'nbb mut ModelContext<'cx, Notebook>,
     ) -> NotebookBuilder<'nbb, 'cx> {
         NotebookBuilder {
             project_handle,
             file,
+            language,
             cx,
             metadata: None,
             nbformat: None,
@@ -59,6 +62,7 @@ impl<'nbb, 'cx: 'nbb> NotebookBuilder<'nbb, 'cx> {
     fn build(self) -> Notebook {
         Notebook {
             file: self.file,
+            language: self.language,
             metadata: self.metadata,
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
@@ -149,14 +153,22 @@ impl project::Item for Notebook {
     where
         Self: Sized,
     {
+        // TODO: If the workspace has an active `NotebookEditor` view for the requested `path`,
+        //       we should activate the existing view.
+        if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
+            info!("Failed to detect extension for path `{:#?}`", path);
+            return None;
+        }
+        info!("Detected `.ipynb` extension for path `{:#?}`", path);
+
+        let language = python_lang(app_cx);
+
         project_handle.update(app_cx, |project, cx| {
             let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
                 return;
             };
-            project.start_language_servers(&worktree, Arc::new(python_lang()), cx);
+            project.start_language_servers(&worktree, language.clone(), cx);
         });
-
-        info!("Detected `.ipynb` extension for path `{:#?}`", path);
 
         let project = project_handle.downgrade();
         let open_buffer_task =
@@ -182,7 +194,7 @@ impl project::Item for Notebook {
 
                 let file = buffer.file().map(|file| file.clone());
                 let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-                NotebookBuilder::new(project, file, cx_model)
+                NotebookBuilder::new(project, file, Some(language), cx_model)
                     .deserialize(&mut deserializer)
                     .map(|builder| builder.build())
                     .unwrap_or_default()

@@ -116,6 +116,7 @@ impl CellBuilder {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
+                        let language = python_lang(cx);
                         let source_lines: Vec<String> = match val {
                             serde_json::Value::String(src) => Ok([src].into()),
                             serde_json::Value::Array(src_lines) => src_lines.into_iter().try_fold(
@@ -140,7 +141,7 @@ impl CellBuilder {
 
                                 let source_buffer = project.create_buffer(
                                     source_lines.join("\n").as_str(),
-                                    Some(Arc::new(python_lang())),
+                                    Some(language),
                                     project_cx,
                                 )?;
 
