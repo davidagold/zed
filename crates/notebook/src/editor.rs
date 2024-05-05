@@ -40,25 +40,43 @@ pub struct NotebookEditor {
 
 impl NotebookEditor {
     fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let cell_sources = notebook
+        let cells = notebook
             .read(cx)
             .cells
             .iter()
-            .map(|cell| cell.source.clone())
+            .map(|cell| cell.clone())
             .collect_vec();
 
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-            for source in cell_sources {
-                let range = ExcerptRange {
-                    context: Range {
-                        start: 0 as usize,
-                        end: source.read(model_cx).len() as usize,
-                    },
-                    primary: None,
+            for (cell, range) in cells
+                .into_iter()
+                .map(|cell| {
+                    let range = ExcerptRange {
+                        context: Range {
+                            start: 0 as usize,
+                            end: cell.source.read(model_cx).len() as _,
+                        },
+                        primary: None,
+                    };
+                    (cell, range)
+                })
+                .collect_vec()
+            {
+                let id: u64 = cell.id.into();
+                let prev_excerpt_id = if id == 1 {
+                    ExcerptId::min()
+                } else {
+                    ExcerptId::from_proto(id - 1)
                 };
-                multi.push_excerpts(source, [range].to_vec(), model_cx);
+                multi.insert_excerpts_with_ids_after(
+                    prev_excerpt_id,
+                    cell.source,
+                    vec![(cell.id.into(), range)],
+                    model_cx,
+                );
             }
+
             multi
         });
 
@@ -196,6 +214,8 @@ impl NotebookEditor {
             })
             .collect_vec()
     }
+
+    fn expand_output_cells<V>(&mut self, cx: &mut ViewContext<V>) {}
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
         let (excerpt_id, buffer_handle, _range) = match self.editor.read(cx).active_excerpt(cx) {
