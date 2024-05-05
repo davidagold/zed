@@ -1,10 +1,15 @@
 import asyncio
+import logging
 import signal
 import sys
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, get_type_hints
 
-import rich
+try:
+    import rich
+except ModuleNotFoundError:
+    logging.warning("Module `rich` not available, printing will not be pretty")
+
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.kernelspec import KernelSpecManager
 from jupyter_client.manager import AsyncKernelManager
