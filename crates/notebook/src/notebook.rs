@@ -224,30 +224,43 @@ impl project::Item for Notebook {
                 .update(&mut cx, |project, cx| {
                     project.open_buffer(cloned_path.clone(), cx)
                 })
-                .ok()
-                .ok_or_else(|| anyhow::anyhow!("Failed to open file"))?
-                .await?;
-            info!("Successfully opened buffer");
+                .map_err(|err| anyhow::anyhow!("Failed to open file: {:#?}", err))?
+                .await
+                .inspect(|_| {
+                    info!(
+                        "Successfully opened notebook file from path `{:#?}`",
+                        cloned_path
+                    )
+                })?;
 
             let project_clone = project.clone();
 
-            let Ok(Some((bytes, file))) = buffer_handle.read_with(&cx, |buffer, cx| {
-                let mut bytes = Vec::<u8>::with_capacity(buffer.len());
-                let n_bytes_maybe_read = buffer
-                    .bytes_in_range(0..buffer.len())
-                    .read_to_end(&mut bytes);
+            let (bytes, file) = buffer_handle
+                .read_with(&cx, |buffer, cx| {
+                    let mut bytes = Vec::<u8>::with_capacity(buffer.len());
+                    let file = (|| {
+                        buffer
+                            .bytes_in_range(0..buffer.len())
+                            .read_to_end(&mut bytes)
+                            .inspect(|n_bytes_read| {
+                                info!("Successfully read {n_bytes_read} bytes from notebook file")
+                            })
+                            .ok()?;
 
-                let n_bytes_read = n_bytes_maybe_read.ok()?;
-                info!(
-                    "Successfully read {} bytes from notebook file",
-                    n_bytes_read
-                );
+                        buffer.file().map(|file| file.clone())
+                    })();
 
-                let file = buffer.file().map(|file| file.clone());
-                Some((bytes, file))
-            }) else {
-                return Err(anyhow!("Failed to read from notebook file"));
-            };
+                    (bytes, file)
+                })
+                .map_err(|err| {
+                    let err = anyhow!(
+                        "Failed to read notebook from notebook file `{:#?}`: {:#?}",
+                        cloned_path,
+                        err
+                    );
+                    log::error!("{err}");
+                    err
+                })?;
 
             let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
             let builder = NotebookBuilder::new(project_clone, file, &mut cx)
@@ -255,7 +268,7 @@ impl project::Item for Notebook {
                 .map_err(|err| anyhow!(err.to_string()))?;
 
             let notebook = builder.build().await;
-            cx.new_model(move |cx_model| notebook)
+            cx.new_model(move |_| notebook)
         });
 
         Some(task)
