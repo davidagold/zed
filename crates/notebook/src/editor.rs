@@ -9,7 +9,6 @@ use gpui::{
     AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
-use itertools::Itertools;
 use language::{self, Buffer, Capability};
 use log::info;
 use project::{self, Project};
@@ -18,6 +17,7 @@ use std::{
     any::{Any, TypeId},
     convert::AsRef,
     ops::Range,
+    sync::Arc,
 };
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
@@ -29,7 +29,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellId, ForOutput, IpynbCodeOutput, StreamOutputTarget},
+    cell::{cell_tab_title, CellId},
     Notebook,
 };
 
@@ -42,12 +42,7 @@ pub struct NotebookEditor {
 
 impl NotebookEditor {
     fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let cells = notebook
-            .read(cx)
-            .cells
-            .iter()
-            .map(|cell| cell.clone())
-            .collect_vec();
+        let cells = notebook.read(cx).cells.clone();
 
         let mut output_buffers_by_id: HashMap<CellId, Model<Buffer>> = cells
             .iter()
@@ -56,7 +51,17 @@ impl NotebookEditor {
                 for action in cell.output_actions.as_ref()? {
                     output_text.append(action.as_rope()?);
                 }
-                let buffer = cx.new_model(|cx| Buffer::local(output_text.to_string(), cx));
+                let buffer = cx.new_model(|cx| {
+                    let title = cell_tab_title(
+                        cell.id.into(),
+                        cell.cell_id.as_ref(),
+                        &cell.cell_type,
+                        true,
+                    );
+                    let mut buffer = Buffer::local(output_text.to_string(), cx);
+                    buffer.file_updated(Arc::from(title), cx);
+                    buffer
+                });
                 Some((cell.id, buffer))
             })
             .collect();
@@ -67,21 +72,17 @@ impl NotebookEditor {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
 
             let mut prev_excerpt_id = ExcerptId::min();
-            for (cell, range) in cells
-                .into_iter()
-                .map(|cell| {
-                    let range = ExcerptRange {
-                        context: Range {
-                            start: 0 as usize,
-                            end: cell.source.read(model_cx).len() as _,
-                        },
-                        primary: None,
-                    };
-                    (cell, range)
-                })
-                .collect_vec()
-            {
+            for cell in cells.iter() {
                 let id: u64 = prev_excerpt_id.to_proto() + 1;
+
+                // Handle source buffer
+                let range = ExcerptRange {
+                    context: Range {
+                        start: 0 as usize,
+                        end: cell.source.read(model_cx).len() as _,
+                    },
+                    primary: None,
+                };
                 multi.insert_excerpts_with_ids_after(
                     prev_excerpt_id,
                     cell.source.clone(),
@@ -90,6 +91,7 @@ impl NotebookEditor {
                 );
                 prev_excerpt_id = ExcerptId::from_proto(id);
 
+                // Handle output buffer if present
                 if let Some(output_buffer) = output_buffers_by_id.remove(&cell.id) {
                     let range = ExcerptRange {
                         context: Range {

@@ -10,7 +10,7 @@ use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{SumTree, Summary};
 use ui::{Context, ViewContext};
 
@@ -20,13 +20,13 @@ use crate::editor::NotebookEditor;
 pub struct Cell {
     pub id: CellId,
     // `cell_id` is a notebook field
-    cell_id: Option<String>,
-    cell_type: CellType,
+    pub cell_id: Option<String>,
+    pub cell_type: CellType,
     pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
     pub execution_count: Option<usize>,
     pub outputs: Option<Vec<IpynbCodeOutput>>,
-    pub output_actions: Option<Vec<ForOutput>>,
+    pub output_actions: Option<Vec<OutputHandler>>,
 }
 
 pub struct CellBuilder {
@@ -37,7 +37,7 @@ pub struct CellBuilder {
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
     outputs: Option<Vec<IpynbCodeOutput>>,
-    output_actions: Option<Vec<ForOutput>>,
+    output_actions: Option<Vec<OutputHandler>>,
 }
 
 impl Debug for CellBuilder {
@@ -47,7 +47,7 @@ impl Debug for CellBuilder {
 }
 
 // A phony file struct we use for excerpt titles.
-struct PhonyFile {
+pub(crate) struct PhonyFile {
     worktree_id: usize,
     title: Arc<std::path::Path>,
     cell_idx: CellId,
@@ -100,6 +100,33 @@ impl File for PhonyFile {
     }
 }
 
+pub(crate) fn cell_tab_title(
+    idx: u64,
+    cell_id: Option<&String>,
+    cell_type: &CellType,
+    for_output: bool,
+) -> PhonyFile {
+    // Not sure why we need to reverse for the desired formatting, but there you go
+    let path_buf: PathBuf = match for_output {
+        false => [format!("Cell {idx}"), format!("({:#?})", cell_type)]
+            .iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect(),
+        true => [format!("Cell {idx}"), "[Output]".to_string()]
+            .iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect(),
+    };
+    PhonyFile {
+        worktree_id: 0,
+        title: Arc::from(path_buf.as_path()),
+        cell_idx: CellId::from(idx),
+        cell_id: cell_id.map(|id| id.clone()),
+    }
+}
+
 impl CellBuilder {
     pub fn new(
         project_handle: &mut WeakModel<Project>,
@@ -147,9 +174,10 @@ impl CellBuilder {
 
                         project_handle
                             .update(cx, |project, project_cx| -> Result<()> {
-                                // TODO: Detect this from the file. Also, get it to work.
+                                let mut source_text = source_lines.join("\n");
+                                source_text.push_str("\n");
                                 let source_buffer = project.create_buffer(
-                                    source_lines.join("\n").as_str(),
+                                    source_text.as_str(),
                                     None,
                                     project_cx,
                                 )?;
@@ -179,23 +207,23 @@ impl CellBuilder {
                                             Stream { name, text } => {
                                                 log::info!("Output text: {:#?}", text);
                                                 match name {
-                                                    StreamOutputTarget::Stdout => {
-                                                        Some(ForOutput::print(Some(text.clone())))
-                                                    }
+                                                    StreamOutputTarget::Stdout => Some(
+                                                        OutputHandler::print(Some(text.clone())),
+                                                    ),
                                                     StreamOutputTarget::Stderr => {
-                                                        Some(ForOutput::print(None))
+                                                        Some(OutputHandler::print(None))
                                                     }
                                                 }
                                             }
                                             DisplayData { data, metadata } => {
-                                                Some(ForOutput::print(None))
+                                                Some(OutputHandler::print(None))
                                             }
                                             ExecutionResult {
                                                 // TODO: Handle MIME types here
                                                 execution_count,
                                                 data,
                                                 metadata,
-                                            } => Some(ForOutput::print(None)),
+                                            } => Some(OutputHandler::print(None)),
                                         }
                                     })
                                     .collect_vec();
@@ -207,19 +235,18 @@ impl CellBuilder {
                     _ => {}
                 };
 
-                let title_text = format!("Cell {:#?}", id);
-                let title = PhonyFile {
-                    worktree_id: 0,
-                    title: Arc::from(std::path::Path::new(title_text.as_str())),
-                    cell_idx: CellId(id),
-                    cell_id: this.cell_id.clone(),
-                };
-
-                if let Some(buffer_handle) = &this.source {
-                    cx.update_model(&buffer_handle, |buffer, cx| {
-                        buffer.file_updated(Arc::new(title), cx);
-                    });
-                }
+                let cell_id = this.cell_id.clone();
+                let cell_type = this.cell_type.clone();
+                (|| -> Option<()> {
+                    let title = cell_tab_title(id, (&cell_id).as_ref(), &cell_type?, false);
+                    if let Some(buffer_handle) = &this.source {
+                        cx.update_model(&buffer_handle, |buffer, cx| {
+                            buffer.file_updated(Arc::new(title), cx);
+                        })
+                        .ok()?;
+                    };
+                    Some(())
+                })();
 
                 Ok(())
             })();
@@ -311,6 +338,15 @@ impl Cells {
     }
 }
 
+impl Clone for Cells {
+    fn clone(&self) -> Self {
+        self.iter().fold(Cells::default(), |mut cells, cell| {
+            cells.push_cell(cell.clone(), &());
+            cells
+        })
+    }
+}
+
 impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
@@ -325,6 +361,12 @@ impl sum_tree::Item for Cell {
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
 pub struct CellId(u64);
+
+impl From<u64> for CellId {
+    fn from(id: u64) -> Self {
+        CellId(id)
+    }
+}
 
 impl From<ExcerptId> for CellId {
     fn from(excerpt_id: ExcerptId) -> Self {
@@ -406,22 +448,28 @@ pub enum StreamOutputTarget {
 pub enum JupyterServerEvent {}
 
 #[derive(Clone, Debug)]
-pub enum ForOutput {
+pub enum OutputHandler {
     Print(Option<String>),
 }
 
-impl ForOutput {
-    pub fn print(text: Option<StreamOutputText>) -> ForOutput {
+impl OutputHandler {
+    pub fn print(text: Option<StreamOutputText>) -> OutputHandler {
         use StreamOutputText::*;
         match text {
-            Some(Text(text)) => ForOutput::Print(Some(text)),
-            Some(MultiLineText(text)) => ForOutput::Print(Some(text.join("\n"))),
-            None => ForOutput::Print(None),
+            Some(Text(text)) => OutputHandler::Print(Some(text.to_string())),
+            Some(MultiLineText(text)) => {
+                let output_text = text
+                    .iter()
+                    .map(|line| line.strip_suffix("\n").unwrap_or(line).to_string())
+                    .join("\n");
+                OutputHandler::Print(Some(output_text))
+            }
+            None => OutputHandler::Print(None),
         }
     }
 
     pub fn as_rope(&self) -> Option<Rope> {
-        let ForOutput::Print(Some(text)) = self else {
+        let OutputHandler::Print(Some(text)) = self else {
             return None;
         };
         let mut out = Rope::new();
@@ -430,7 +478,7 @@ impl ForOutput {
     }
 
     pub fn to_output_buffer(self, cx: &mut ViewContext<NotebookEditor>) -> Option<Model<Buffer>> {
-        let ForOutput::Print(Some(text)) = self else {
+        let OutputHandler::Print(Some(text)) = self else {
             return None;
         };
         Some(cx.new_model(|cx| Buffer::local(text, cx)))
