@@ -1,16 +1,19 @@
 //! Jupyter support for Zed.
 
+use collections::HashMap;
 use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer,
     MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ModelContext,
-    ParentElement, Subscription, View,
+    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    Subscription, View,
 };
 use itertools::Itertools;
 use language::{self, Buffer, Capability};
+use log::info;
 use project::{self, Project};
+use rope::Rope;
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
@@ -46,11 +49,25 @@ impl NotebookEditor {
             .map(|cell| cell.clone())
             .collect_vec();
 
+        let mut output_buffers_by_id: HashMap<CellId, Model<Buffer>> = cells
+            .iter()
+            .filter_map(|cell| {
+                let mut output_text = Rope::new();
+                for action in cell.output_actions.as_ref()? {
+                    output_text.append(action.as_rope()?);
+                }
+                let buffer = cx.new_model(|cx| Buffer::local(output_text.to_string(), cx));
+                Some((cell.id, buffer))
+            })
+            .collect();
+
+        info!("{:#?}", output_buffers_by_id);
+
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
 
+            let mut prev_excerpt_id = ExcerptId::min();
             for (cell, range) in cells
-                .iter()
                 .into_iter()
                 .map(|cell| {
                     let range = ExcerptRange {
@@ -64,25 +81,30 @@ impl NotebookEditor {
                 })
                 .collect_vec()
             {
-                let id: u64 = cell.id.into();
-                let prev_excerpt_id = if id == 1 {
-                    ExcerptId::min()
-                } else {
-                    ExcerptId::from_proto(id - 1)
-                };
-
+                let id: u64 = prev_excerpt_id.to_proto() + 1;
                 multi.insert_excerpts_with_ids_after(
                     prev_excerpt_id,
                     cell.source.clone(),
-                    vec![(cell.id.into(), range)],
+                    vec![(ExcerptId::from_proto(id), range)],
                     model_cx,
                 );
+                prev_excerpt_id = ExcerptId::from_proto(id);
 
-                // TODO: Do something with `maybe_output`
-                let output_buffers =
-                    NotebookEditor::get_cell_output_buffers(&cells, &mut multi, None, model_cx);
-                for output in output_buffers {
-                    log::info!("{:#?}", output);
+                if let Some(output_buffer) = output_buffers_by_id.remove(&cell.id) {
+                    let range = ExcerptRange {
+                        context: Range {
+                            start: 0 as usize,
+                            end: output_buffer.read(model_cx).len() as _,
+                        },
+                        primary: None,
+                    };
+                    multi.insert_excerpts_with_ids_after(
+                        prev_excerpt_id,
+                        output_buffer,
+                        vec![(ExcerptId::from_proto(id + 1), range)],
+                        model_cx,
+                    );
+                    prev_excerpt_id = ExcerptId::from_proto(id + 1);
                 }
             }
 
@@ -131,64 +153,6 @@ impl NotebookEditor {
         };
 
         this
-    }
-
-    fn get_cell_output_buffers(
-        cells: &Vec<Cell>,
-        multi: &mut MultiBuffer,
-        for_cell_ids: Option<Vec<CellId>>,
-        cx: &mut ModelContext<MultiBuffer>,
-    ) -> Vec<Option<(ExcerptRange<usize>, Model<Buffer>)>> {
-        let output_actions: Vec<Option<ForOutput>> = cells
-            .iter()
-            .flat_map(|cell| {
-                let Some(outputs) = &cell.outputs else {
-                    return Vec::new();
-                };
-                outputs
-                    .into_iter()
-                    .map(|output| {
-                        use IpynbCodeOutput::*;
-                        let output_action = match output {
-                            Stream { name, text } => {
-                                log::info!("Output text: {:#?}", text);
-                                match name {
-                                    StreamOutputTarget::Stdout => {
-                                        ForOutput::print(Some(text.clone()))
-                                    }
-                                    StreamOutputTarget::Stderr => ForOutput::print(None),
-                                }
-                            }
-                            DisplayData { data, metadata } => ForOutput::print(None),
-                            ExecutionResult {
-                                // TODO: Handle MIME types here
-                                execution_count,
-                                data,
-                                metadata,
-                            } => ForOutput::print(None),
-                        };
-                        Some(output_action)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let buffers_by_range: Vec<Option<(ExcerptRange<usize>, Model<Buffer>)>> = output_actions
-            .into_iter()
-            .map(|maybe_output_action| match maybe_output_action {
-                Some(ForOutput::Print(Some(text))) => {
-                    let range = ExcerptRange {
-                        context: 0..text.len(),
-                        primary: None,
-                    };
-                    let buffer = cx.new_model(|cx| Buffer::local(text, cx));
-                    Some((range, buffer))
-                }
-                _ => None,
-            })
-            .collect();
-
-        buffers_by_range
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {

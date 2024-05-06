@@ -3,14 +3,18 @@ use anyhow::{anyhow, Result};
 use collections::HashMap;
 use editor::ExcerptId;
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, WeakModel};
+use itertools::Itertools;
 use language::{Buffer, File};
 use project::Project;
+use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
 use std::{any::Any, fmt::Debug, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::Context;
+use ui::{Context, ViewContext};
+
+use crate::editor::NotebookEditor;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -22,6 +26,7 @@ pub struct Cell {
     pub source: Model<Buffer>,
     pub execution_count: Option<usize>,
     pub outputs: Option<Vec<IpynbCodeOutput>>,
+    pub output_actions: Option<Vec<ForOutput>>,
 }
 
 pub struct CellBuilder {
@@ -32,6 +37,7 @@ pub struct CellBuilder {
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
     outputs: Option<Vec<IpynbCodeOutput>>,
+    output_actions: Option<Vec<ForOutput>>,
 }
 
 impl Debug for CellBuilder {
@@ -109,6 +115,7 @@ impl CellBuilder {
             source: None,
             execution_count: None,
             outputs: None,
+            output_actions: None,
         };
 
         for (key, val) in map {
@@ -120,7 +127,6 @@ impl CellBuilder {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
-                        // let language = python_lang(cx);
                         let source_lines: Vec<String> = match val {
                             serde_json::Value::String(src) => Ok([src].into()),
                             serde_json::Value::Array(src_lines) => src_lines.into_iter().try_fold(
@@ -158,15 +164,45 @@ impl CellBuilder {
                     }
                     "outputs" => {
                         // TODO: Validate `cell_type == 'code'`
-                        // log::info!("Cell output value: {:#?}", val);
-                        // let output = val.as_array().ok_or_else(|| {
-                        //
-                        // anyhow!("Error parsing {:#?}", val)
-                        // })?;
-                        // log::info!("`output` = {:#?}", output);
-                        let outputs = serde_json::from_value::<Vec<IpynbCodeOutput>>(val);
-                        // log::info!("Parsed cell output as: {:#?}", outputs);
-                        this.outputs = outputs.ok();
+                        log::debug!("Cell output value: {:#?}", val);
+                        let outputs = serde_json::from_value::<Option<Vec<IpynbCodeOutput>>>(val)?;
+                        log::debug!("Parsed cell output as: {:#?}", outputs);
+                        this.outputs = outputs;
+                        this.output_actions = match this.outputs.as_deref() {
+                            Some([]) => None,
+                            Some(outputs) => {
+                                let output_actions = outputs
+                                    .iter()
+                                    .filter_map(|output| {
+                                        use IpynbCodeOutput::*;
+                                        match output {
+                                            Stream { name, text } => {
+                                                log::info!("Output text: {:#?}", text);
+                                                match name {
+                                                    StreamOutputTarget::Stdout => {
+                                                        Some(ForOutput::print(Some(text.clone())))
+                                                    }
+                                                    StreamOutputTarget::Stderr => {
+                                                        Some(ForOutput::print(None))
+                                                    }
+                                                }
+                                            }
+                                            DisplayData { data, metadata } => {
+                                                Some(ForOutput::print(None))
+                                            }
+                                            ExecutionResult {
+                                                // TODO: Handle MIME types here
+                                                execution_count,
+                                                data,
+                                                metadata,
+                                            } => Some(ForOutput::print(None)),
+                                        }
+                                    })
+                                    .collect_vec();
+                                Some(output_actions)
+                            }
+                            None => None,
+                        };
                     }
                     _ => {}
                 };
@@ -210,6 +246,7 @@ impl CellBuilder {
             source: self.source.unwrap(),
             execution_count: self.execution_count,
             outputs: self.outputs,
+            output_actions: self.output_actions,
         };
 
         cell
@@ -319,6 +356,13 @@ impl Summary for CellSummary {
     fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {}
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StreamOutputText {
+    Text(String),
+    MultiLineText(Vec<String>),
+}
+
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "output_type")]
@@ -326,7 +370,7 @@ pub enum IpynbCodeOutput {
     #[serde(alias = "stream")]
     Stream {
         name: StreamOutputTarget,
-        text: String,
+        text: StreamOutputText,
     },
     #[serde(alias = "display_data")]
     DisplayData {
@@ -343,6 +387,7 @@ pub enum IpynbCodeOutput {
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
 #[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
 pub enum MimeData {
     MultiLineText(Vec<String>),
     B64EncodedMultiLineText(Vec<String>),
@@ -352,7 +397,9 @@ pub enum MimeData {
 // TODO: Appropriate deserialize from string value
 #[derive(Clone, Debug, Deserialize)]
 pub enum StreamOutputTarget {
+    #[serde(alias = "stdout")]
     Stdout,
+    #[serde(alias = "stderr")]
     Stderr,
 }
 
@@ -364,11 +411,29 @@ pub enum ForOutput {
 }
 
 impl ForOutput {
-    pub fn print(text: Option<String>) -> ForOutput {
+    pub fn print(text: Option<StreamOutputText>) -> ForOutput {
+        use StreamOutputText::*;
         match text {
-            Some(text) => ForOutput::Print(Some(text)),
+            Some(Text(text)) => ForOutput::Print(Some(text)),
+            Some(MultiLineText(text)) => ForOutput::Print(Some(text.join("\n"))),
             None => ForOutput::Print(None),
         }
+    }
+
+    pub fn as_rope(&self) -> Option<Rope> {
+        let ForOutput::Print(Some(text)) = self else {
+            return None;
+        };
+        let mut out = Rope::new();
+        out.push(text.as_str());
+        Some(out)
+    }
+
+    pub fn to_output_buffer(self, cx: &mut ViewContext<NotebookEditor>) -> Option<Model<Buffer>> {
+        let ForOutput::Print(Some(text)) = self else {
+            return None;
+        };
+        Some(cx.new_model(|cx| Buffer::local(text, cx)))
     }
 }
 
