@@ -1,27 +1,32 @@
+// use crate::common::python_lang;
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use editor::ExcerptId;
-use gpui::{AppContext, Flatten, Model, WeakModel};
+use gpui::{AppContext, AsyncAppContext, Flatten, Model, WeakModel};
+use itertools::Itertools;
 use language::{Buffer, File};
-
 use project::Project;
+use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
-use std::{any::Any, fmt::Debug, sync::Arc};
+use serde_json::Value;
+use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::Context;
+use ui::{Context, ViewContext};
 
-use crate::common::python_lang;
+use crate::editor::NotebookEditor;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub id: CellId,
     // `cell_id` is a notebook field
-    cell_id: Option<String>,
-    cell_type: CellType,
-    metadata: HashMap<String, serde_json::Value>,
+    pub cell_id: Option<String>,
+    pub cell_type: CellType,
+    pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
-    execution_count: Option<usize>,
+    pub execution_count: Option<usize>,
+    pub outputs: Option<Vec<IpynbCodeOutput>>,
+    pub output_actions: Option<Vec<OutputHandler>>,
 }
 
 pub struct CellBuilder {
@@ -31,6 +36,8 @@ pub struct CellBuilder {
     metadata: Option<HashMap<String, serde_json::Value>>,
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
+    outputs: Option<Vec<IpynbCodeOutput>>,
+    output_actions: Option<Vec<OutputHandler>>,
 }
 
 impl Debug for CellBuilder {
@@ -40,7 +47,7 @@ impl Debug for CellBuilder {
 }
 
 // A phony file struct we use for excerpt titles.
-struct PhonyFile {
+pub(crate) struct PhonyFile {
     worktree_id: usize,
     title: Arc<std::path::Path>,
     cell_idx: CellId,
@@ -93,10 +100,37 @@ impl File for PhonyFile {
     }
 }
 
+pub(crate) fn cell_tab_title(
+    idx: u64,
+    cell_id: Option<&String>,
+    cell_type: &CellType,
+    for_output: bool,
+) -> PhonyFile {
+    // Not sure why we need to reverse for the desired formatting, but there you go
+    let path_buf: PathBuf = match for_output {
+        false => [format!("Cell {idx}"), format!("({:#?})", cell_type)]
+            .iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect(),
+        true => [format!("Cell {idx}"), "[Output]".to_string()]
+            .iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect(),
+    };
+    PhonyFile {
+        worktree_id: 0,
+        title: Arc::from(path_buf.as_path()),
+        cell_idx: CellId::from(idx),
+        cell_id: cell_id.map(|id| id.clone()),
+    }
+}
+
 impl CellBuilder {
     pub fn new(
         project_handle: &mut WeakModel<Project>,
-        cx: &mut AppContext,
+        cx: &mut AsyncAppContext,
         id: u64,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> CellBuilder {
@@ -107,6 +141,8 @@ impl CellBuilder {
             metadata: None,
             source: None,
             execution_count: None,
+            outputs: None,
+            output_actions: None,
         };
 
         for (key, val) in map {
@@ -118,7 +154,6 @@ impl CellBuilder {
                     }
                     "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
-                        let language = python_lang(cx);
                         let source_lines: Vec<String> = match val {
                             serde_json::Value::String(src) => Ok([src].into()),
                             serde_json::Value::Array(src_lines) => src_lines.into_iter().try_fold(
@@ -134,21 +169,20 @@ impl CellBuilder {
                                     Ok(source_lines)
                                 },
                             ),
-                            _ => Err(anyhow::anyhow!("Unexpected source format: {:#?}", val)),
+                            _ => Err(anyhow!("Unexpected source format: {:#?}", val)),
                         }?;
 
                         project_handle
                             .update(cx, |project, project_cx| -> Result<()> {
-                                // TODO: Detect this from the file. Also, get it to work.
-
+                                let mut source_text = source_lines.join("\n");
+                                source_text.push_str("\n");
                                 let source_buffer = project.create_buffer(
-                                    source_lines.join("\n").as_str(),
-                                    Some(language),
+                                    source_text.as_str(),
+                                    None,
                                     project_cx,
                                 )?;
 
                                 this.source.replace(source_buffer);
-
                                 Ok(())
                             })
                             .flatten()?;
@@ -156,22 +190,63 @@ impl CellBuilder {
                     "execution_count" => {
                         this.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
+                    "outputs" => {
+                        // TODO: Validate `cell_type == 'code'`
+                        log::debug!("Cell output value: {:#?}", val);
+                        let outputs = serde_json::from_value::<Option<Vec<IpynbCodeOutput>>>(val)?;
+                        log::debug!("Parsed cell output as: {:#?}", outputs);
+                        this.outputs = outputs;
+                        this.output_actions = match this.outputs.as_deref() {
+                            Some([]) => None,
+                            Some(outputs) => {
+                                let output_actions = outputs
+                                    .iter()
+                                    .filter_map(|output| {
+                                        use IpynbCodeOutput::*;
+                                        match output {
+                                            Stream { name, text } => {
+                                                log::info!("Output text: {:#?}", text);
+                                                match name {
+                                                    StreamOutputTarget::Stdout => Some(
+                                                        OutputHandler::print(Some(text.clone())),
+                                                    ),
+                                                    StreamOutputTarget::Stderr => {
+                                                        Some(OutputHandler::print(None))
+                                                    }
+                                                }
+                                            }
+                                            DisplayData { data, metadata } => {
+                                                Some(OutputHandler::print(None))
+                                            }
+                                            ExecutionResult {
+                                                // TODO: Handle MIME types here
+                                                execution_count,
+                                                data,
+                                                metadata,
+                                            } => Some(OutputHandler::print(None)),
+                                        }
+                                    })
+                                    .collect_vec();
+                                Some(output_actions)
+                            }
+                            None => None,
+                        };
+                    }
                     _ => {}
                 };
 
-                let title_text = format!("Cell {:#?}", id);
-                let title = PhonyFile {
-                    worktree_id: 0,
-                    title: Arc::from(std::path::Path::new(title_text.as_str())),
-                    cell_idx: CellId(id),
-                    cell_id: this.cell_id.clone(),
-                };
-
-                if let Some(buffer_handle) = &this.source {
-                    cx.update_model(&buffer_handle, |buffer, cx| {
-                        buffer.file_updated(Arc::new(title), cx);
-                    });
-                }
+                let cell_id = this.cell_id.clone();
+                let cell_type = this.cell_type.clone();
+                (|| -> Option<()> {
+                    let title = cell_tab_title(id, (&cell_id).as_ref(), &cell_type?, false);
+                    if let Some(buffer_handle) = &this.source {
+                        cx.update_model(&buffer_handle, |buffer, cx| {
+                            buffer.file_updated(Arc::new(title), cx);
+                        })
+                        .ok()?;
+                    };
+                    Some(())
+                })();
 
                 Ok(())
             })();
@@ -190,14 +265,18 @@ impl CellBuilder {
     }
 
     pub fn build(self) -> Cell {
-        Cell {
+        let cell = Cell {
             id: CellId(self.id),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
             metadata: self.metadata.unwrap(),
             source: self.source.unwrap(),
             execution_count: self.execution_count,
-        }
+            outputs: self.outputs,
+            output_actions: self.output_actions,
+        };
+
+        cell
     }
 }
 
@@ -259,6 +338,15 @@ impl Cells {
     }
 }
 
+impl Clone for Cells {
+    fn clone(&self) -> Self {
+        self.iter().fold(Cells::default(), |mut cells, cell| {
+            cells.push_cell(cell.clone(), &());
+            cells
+        })
+    }
+}
+
 impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
@@ -273,6 +361,12 @@ impl sum_tree::Item for Cell {
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
 pub struct CellId(u64);
+
+impl From<u64> for CellId {
+    fn from(id: u64) -> Self {
+        CellId(id)
+    }
+}
 
 impl From<ExcerptId> for CellId {
     fn from(excerpt_id: ExcerptId) -> Self {
@@ -304,23 +398,29 @@ impl Summary for CellSummary {
     fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {}
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StreamOutputText {
+    Text(String),
+    MultiLineText(Vec<String>),
+}
+
 // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cell-outputs
-// TODO: Better typing for `output_type`
-#[derive(Deserialize)]
-enum IpynbCodeOutput {
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "output_type")]
+pub enum IpynbCodeOutput {
+    #[serde(alias = "stream")]
     Stream {
-        output_type: String,
         name: StreamOutputTarget,
-        // text: Rope,
-        text: String,
+        text: StreamOutputText,
     },
+    #[serde(alias = "display_data")]
     DisplayData {
-        output_type: String,
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
     },
+    #[serde(alias = "execute_result")]
     ExecutionResult {
-        output_type: String,
         execution_count: usize,
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
@@ -328,7 +428,8 @@ enum IpynbCodeOutput {
 }
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
 pub enum MimeData {
     MultiLineText(Vec<String>),
     B64EncodedMultiLineText(Vec<String>),
@@ -336,10 +437,60 @@ pub enum MimeData {
 }
 
 // TODO: Appropriate deserialize from string value
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum StreamOutputTarget {
+    #[serde(alias = "stdout")]
     Stdout,
+    #[serde(alias = "stderr")]
     Stderr,
 }
 
-enum JupyterServerEvent {}
+pub enum JupyterServerEvent {}
+
+#[derive(Clone, Debug)]
+pub enum OutputHandler {
+    Print(Option<String>),
+}
+
+impl OutputHandler {
+    pub fn print(text: Option<StreamOutputText>) -> OutputHandler {
+        use StreamOutputText::*;
+        match text {
+            Some(Text(text)) => OutputHandler::Print(Some(text.to_string())),
+            Some(MultiLineText(text)) => {
+                let output_text = text
+                    .iter()
+                    .map(|line| line.strip_suffix("\n").unwrap_or(line).to_string())
+                    .join("\n");
+                OutputHandler::Print(Some(output_text))
+            }
+            None => OutputHandler::Print(None),
+        }
+    }
+
+    pub fn as_rope(&self) -> Option<Rope> {
+        let OutputHandler::Print(Some(text)) = self else {
+            return None;
+        };
+        let mut out = Rope::new();
+        out.push(text.as_str());
+        Some(out)
+    }
+
+    pub fn to_output_buffer(self, cx: &mut ViewContext<NotebookEditor>) -> Option<Model<Buffer>> {
+        let OutputHandler::Print(Some(text)) = self else {
+            return None;
+        };
+        Some(cx.new_model(|cx| Buffer::local(text, cx)))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct KernelSpec {
+    pub argv: Option<Vec<String>>,
+    pub display_name: String,
+    pub language: String,
+    pub interrup_mode: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub metadata: Option<HashMap<String, Value>>,
+}
