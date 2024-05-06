@@ -12,9 +12,9 @@ use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
 use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{SumTree, Summary};
-use ui::{Context, ViewContext};
+use ui::Context;
 
-use crate::editor::NotebookEditor;
+use crate::do_in;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -26,20 +26,23 @@ pub struct Cell {
     pub source: Model<Buffer>,
     pub execution_count: Option<usize>,
     pub outputs: Option<Vec<IpynbCodeOutput>>,
-    pub output_content: Option<Vec<Model<Buffer>>>,
+    pub output_content: Option<Model<Buffer>>,
 }
 
-impl Cell {
-    pub fn excerpt_range<M>(&self, cx: &ModelContext<M>) -> ExcerptRange<usize> {
-        ExcerptRange {
-            context: std::ops::Range {
-                start: 0 as usize,
-                end: self.source.read(cx).len() as _,
-            },
-            primary: None,
-        }
+pub fn excerpt_range_over_buffer<M>(
+    buffer: &Model<Buffer>,
+    cx: &ModelContext<M>,
+) -> ExcerptRange<usize> {
+    ExcerptRange {
+        context: std::ops::Range {
+            start: 0 as usize,
+            end: buffer.read(cx).len() as _,
+        },
+        primary: None,
     }
 }
+
+impl Cell {}
 
 pub struct CellBuilder {
     id: u64,
@@ -49,7 +52,7 @@ pub struct CellBuilder {
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
     outputs: Option<Vec<IpynbCodeOutput>>,
-    output_content: Option<Vec<Model<Buffer>>>,
+    output_content: Option<Model<Buffer>>,
 }
 
 impl Debug for CellBuilder {
@@ -112,7 +115,7 @@ impl File for PhonyFile {
     }
 }
 
-pub(crate) fn cell_tab_title(
+pub(crate) fn title_for_cell_excerpt(
     idx: u64,
     cell_id: Option<&String>,
     cell_type: &CellType,
@@ -156,7 +159,7 @@ impl CellBuilder {
         };
 
         for (key, val) in map {
-            let result_parse_entry = (|| -> Result<()> {
+            let result_parse_entry = do_in!(|| -> Result<_> {
                 match key.as_str() {
                     "cell_id" => this.cell_id = val.as_str().map(|s| s.to_string()),
                     "cell_type" => {
@@ -172,7 +175,6 @@ impl CellBuilder {
                                     let line = line_as_val.as_str().ok_or_else(|| {
                                         anyhow!("Source line `{:#?}` is not a string", line_as_val)
                                     })?;
-
                                     source_lines
                                         .push(line.strip_suffix("\n").unwrap_or(line).to_string());
 
@@ -198,6 +200,7 @@ impl CellBuilder {
                             .flatten()?;
                     }
                     "execution_count" => {
+                        // TODO: Handle this more carefully
                         this.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
                     "outputs" => {
@@ -212,24 +215,14 @@ impl CellBuilder {
                         this.output_content = match this.outputs.as_deref() {
                             Some([]) => None,
                             Some(outputs) => {
-                                Some(
-                                    outputs
-                                        .iter()
-                                        .flat_map(|output| {
-                                            outputs.iter().filter_map(|o| o.try_into().ok())
-                                        })
-                                        .filter_map(|handler: OutputHandler| {
-                                            // TODO: Generic over MIME type and other display options
-                                            let title = cell_tab_title(
-                                                this.id.into(),
-                                                this.cell_id.as_ref(),
-                                                this.cell_type.as_ref().unwrap_or(&CellType::Raw),
-                                                true,
-                                            );
-                                            handler.to_buffer(title, cx)
-                                        })
-                                        .collect_vec(),
-                                )
+                                // TODO: Generic over MIME type and other display options
+                                let title = title_for_cell_excerpt(
+                                    this.id.into(),
+                                    this.cell_id.as_ref(),
+                                    this.cell_type.as_ref().unwrap_or(&CellType::Raw),
+                                    true,
+                                );
+                                OutputHandler::try_as_buffer(outputs.iter(), title, cx)
                             }
                             None => None,
                         }
@@ -239,19 +232,18 @@ impl CellBuilder {
 
                 let cell_id = this.cell_id.clone();
                 let cell_type = this.cell_type.clone();
-                (|| -> Option<()> {
-                    let title = cell_tab_title(id, (&cell_id).as_ref(), &cell_type?, false);
+                do_in!(|| -> Option<_> {
+                    let title = title_for_cell_excerpt(id, (&cell_id).as_ref(), &cell_type?, false);
                     if let Some(buffer_handle) = &this.source {
                         cx.update_model(&buffer_handle, |buffer, cx| {
                             buffer.file_updated(Arc::new(title), cx);
                         })
                         .ok()?;
                     };
-                    Some(())
-                })();
+                });
 
                 Ok(())
-            })();
+            });
 
             match result_parse_entry {
                 Ok(()) => log::info!("Successfully parsed notebook entry with key '{:#?}'", key),
@@ -449,6 +441,11 @@ pub enum StreamOutputTarget {
 
 pub enum JupyterServerEvent {}
 
+// `DisplayMapping`
+// For now, we have `Output` x `DisplayMapping` -> `enum Display { Buffer, impl IntoElement }`
+// But in general, there's no reason to treat `Buffer` specially.
+// We do so currently only because we rely ~100% on the existing editor implementation.
+// When notebooks are better integrated, we can `Output` x `DisplayMapping` -> `impl IntoElement`
 #[derive(Clone, Debug)]
 pub enum OutputHandler {
     Print(Option<String>),
@@ -471,10 +468,6 @@ impl OutputHandler {
         }
     }
 
-    pub fn to_media() {
-        unimplemented!()
-    }
-
     pub fn as_rope(&self) -> Option<Rope> {
         let OutputHandler::Print(Some(text)) = self else {
             return None;
@@ -484,13 +477,31 @@ impl OutputHandler {
         Some(out)
     }
 
-    pub fn to_buffer(self, title: PhonyFile, cx: &mut AsyncAppContext) -> Option<Model<Buffer>> {
-        // TODO: Why do we reduce to a single string before this point?
-        let OutputHandler::Print(Some(text)) = self else {
-            return None;
-        };
+    pub fn to_media() {
+        unimplemented!()
+    }
+
+    pub(crate) fn try_as_buffer<'a>(
+        outputs: impl Iterator<Item = &'a IpynbCodeOutput>,
+        title: PhonyFile,
+        cx: &mut AsyncAppContext,
+    ) -> Option<Model<Buffer>> {
+        // TODO: For MVP we just handle the `stream` output type, for which it is appropriate
+        //       to concatenate multiple outputs.
+        let content = outputs
+            .filter_map(|o| -> Option<OutputHandler> { o.try_into().ok() })
+            .map(|h: OutputHandler| h.as_rope())
+            .fold(Rope::new(), |mut base, content| {
+                if content.is_none() {
+                    return base;
+                };
+                base.append(content.unwrap());
+                base.append("\n".into());
+                base
+            });
+
         cx.new_model(|cx| {
-            let mut buffer = Buffer::local(text, cx);
+            let mut buffer = Buffer::local(content.to_string(), cx);
             buffer.file_updated(Arc::from(title), cx);
             buffer
         })
