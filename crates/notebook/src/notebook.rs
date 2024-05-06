@@ -66,7 +66,7 @@ impl Notebook {
             .await;
 
         self.language = language.ok().inspect(|lang| {
-            match (|| -> anyhow::Result<()> {
+            match do_in!(|| -> anyhow::Result<()> {
                 let handle = &project
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("Cannot upgrade project"))?;
@@ -76,7 +76,7 @@ impl Notebook {
                         project.set_language_for_buffer(&cell.source, lang.clone(), cx)
                     }
                 })
-            })() {
+            }) {
                 Ok(_) => log::info!("Successfully set languages for all source buffers"),
                 Err(err) => error!(
                     "Failed to set language for at least one source buffer: {:#?}",
@@ -151,7 +151,7 @@ impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
     {
         while let Some((key, val)) = map.next_entry()? {
             // Work in a closure to propagate errors without returning early
-            let result_parse_entry = (|| -> Result<(), A::Error> {
+            let result_parse_entry = do_in!(|| -> Result<(), A::Error> {
                 match key {
                     "metadata" => self.metadata = parse_value(val)?,
                     "nbformat" => self.nbformat = parse_value(val)?,
@@ -175,7 +175,7 @@ impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
                 };
 
                 Ok(())
-            })();
+            });
 
             match result_parse_entry {
                 Ok(()) => log::info!("Successfully parsed notebook entry with key '{:#?}'", key),
@@ -240,7 +240,7 @@ impl project::Item for Notebook {
             let (bytes, file) = buffer_handle
                 .read_with(&cx, |buffer, cx| {
                     let mut bytes = Vec::<u8>::with_capacity(buffer.len());
-                    let file = (|| {
+                    let file = do_in!(|| -> Option<Arc<dyn language::File>> {
                         buffer
                             .bytes_in_range(0..buffer.len())
                             .read_to_end(&mut bytes)
@@ -250,7 +250,7 @@ impl project::Item for Notebook {
                             .ok()?;
 
                         buffer.file().map(|file| file.clone())
-                    })();
+                    });
 
                     (bytes, file)
                 })

@@ -2,22 +2,17 @@
 
 use collections::HashMap;
 use editor::{
-    items::entry_label_color, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer,
-    MAX_TAB_TITLE_LEN,
+    items::entry_label_color, Editor, EditorEvent, ExcerptId, MultiBuffer, MAX_TAB_TITLE_LEN,
 };
 use gpui::{
     AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
 use language::{self, Buffer, Capability};
-use log::info;
 use project::{self, Project};
-use rope::Rope;
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
-    ops::Range,
-    sync::Arc,
 };
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
@@ -29,7 +24,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{cell_tab_title, CellId},
+    cell::{excerpt_range_over_buffer, CellId},
     Notebook,
 };
 
@@ -46,13 +41,9 @@ impl NotebookEditor {
 
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-            let output_content_by_id: HashMap<&CellId, Model<Buffer>> = cells
+            let mut output_content_by_cell_id: HashMap<&CellId, Model<Buffer>> = cells
                 .iter()
-                .filter_map(|cell| {
-                    //
-
-                    (&cell.id, cell.output_content?)
-                })
+                .filter_map(|cell| Some((&cell.id, cell.output_content.clone()?)))
                 .collect();
 
             // TODO: Actually guarantee some invariance in `CellId` -> `ExcerptId`
@@ -61,13 +52,7 @@ impl NotebookEditor {
                 let id: u64 = prev_excerpt_id.to_proto() + 1;
 
                 // Handle source buffer
-                let range = ExcerptRange {
-                    context: Range {
-                        start: 0 as usize,
-                        end: cell.source.read(model_cx).len() as _,
-                    },
-                    primary: None,
-                };
+                let range = excerpt_range_over_buffer(&cell.source, model_cx);
                 multi.insert_excerpts_with_ids_after(
                     prev_excerpt_id,
                     cell.source.clone(),
@@ -77,11 +62,12 @@ impl NotebookEditor {
                 prev_excerpt_id = ExcerptId::from_proto(id);
 
                 // Handle output buffer if present
-                if let Some(output_buffer) = output_buffers_by_id.remove(&cell.id) {
+                if let Some(output_buffer) = output_content_by_cell_id.remove(&cell.id) {
+                    let range = excerpt_range_over_buffer(&output_buffer, model_cx);
                     multi.insert_excerpts_with_ids_after(
                         prev_excerpt_id,
                         output_buffer,
-                        vec![(ExcerptId::from_proto(id + 1), cell.excerpt_range(model_cx))],
+                        vec![(ExcerptId::from_proto(id + 1), range)],
                         model_cx,
                     );
                     prev_excerpt_id = ExcerptId::from_proto(id + 1);
@@ -125,14 +111,12 @@ impl NotebookEditor {
         })
         .detach();
 
-        let this = NotebookEditor {
+        NotebookEditor {
             notebook,
             editor,
             focus_handle,
             _subscriptions: [subscription].into(),
-        };
-
-        this
+        }
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
