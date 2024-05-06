@@ -6,9 +6,9 @@ name = "pypi"
 [packages]
 jupyter-server = "*"
 jupyter-client = "*"
-pydantic = "*"
 
 [dev-packages]
+pydantic = "*"
 rich = "*"
 
 [requires]
