@@ -253,9 +253,8 @@ impl project::Item for Notebook {
             let builder = NotebookBuilder::new(project_clone, file, &mut cx)
                 .deserialize(&mut deserializer)
                 .map_err(|err| anyhow!(err.to_string()))?;
-            // .await
-            let notebook = builder.build().await;
 
+            let notebook = builder.build().await;
             cx.new_model(move |cx_model| notebook)
         });
 
