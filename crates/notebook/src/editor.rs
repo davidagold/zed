@@ -44,33 +44,18 @@ impl NotebookEditor {
     fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
         let cells = notebook.read(cx).cells.clone();
 
-        let mut output_buffers_by_id: HashMap<CellId, Model<Buffer>> = cells
-            .iter()
-            .filter_map(|cell| {
-                let mut output_text = Rope::new();
-                for action in cell.output_actions.as_ref()? {
-                    output_text.append(action.as_rope()?);
-                }
-                let buffer = cx.new_model(|cx| {
-                    let title = cell_tab_title(
-                        cell.id.into(),
-                        cell.cell_id.as_ref(),
-                        &cell.cell_type,
-                        true,
-                    );
-                    let mut buffer = Buffer::local(output_text.to_string(), cx);
-                    buffer.file_updated(Arc::from(title), cx);
-                    buffer
-                });
-                Some((cell.id, buffer))
-            })
-            .collect();
-
-        info!("{:#?}", output_buffers_by_id);
-
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
+            let output_content_by_id: HashMap<&CellId, Model<Buffer>> = cells
+                .iter()
+                .filter_map(|cell| {
+                    //
 
+                    (&cell.id, cell.output_content?)
+                })
+                .collect();
+
+            // TODO: Actually guarantee some invariance in `CellId` -> `ExcerptId`
             let mut prev_excerpt_id = ExcerptId::min();
             for cell in cells.iter() {
                 let id: u64 = prev_excerpt_id.to_proto() + 1;
@@ -93,17 +78,10 @@ impl NotebookEditor {
 
                 // Handle output buffer if present
                 if let Some(output_buffer) = output_buffers_by_id.remove(&cell.id) {
-                    let range = ExcerptRange {
-                        context: Range {
-                            start: 0 as usize,
-                            end: output_buffer.read(model_cx).len() as _,
-                        },
-                        primary: None,
-                    };
                     multi.insert_excerpts_with_ids_after(
                         prev_excerpt_id,
                         output_buffer,
-                        vec![(ExcerptId::from_proto(id + 1), range)],
+                        vec![(ExcerptId::from_proto(id + 1), cell.excerpt_range(model_cx))],
                         model_cx,
                     );
                     prev_excerpt_id = ExcerptId::from_proto(id + 1);
