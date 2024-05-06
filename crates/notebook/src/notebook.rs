@@ -235,7 +235,7 @@ impl project::Item for Notebook {
                     )
                 })?;
 
-            let project_clone = project.clone();
+            let cloned_project = project.clone();
 
             let (bytes, file) = buffer_handle
                 .read_with(&cx, |buffer, cx| {
@@ -262,7 +262,7 @@ impl project::Item for Notebook {
                 }))?;
 
             let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-            let builder = NotebookBuilder::new(project_clone, file, &mut cx)
+            let builder = NotebookBuilder::new(cloned_project, file, &mut cx)
                 .deserialize(&mut deserializer)
                 .map_err(forward_err_with(|err| {
                     format!(
