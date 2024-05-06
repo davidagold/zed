@@ -106,16 +106,14 @@ pub(crate) fn cell_tab_title(
     cell_type: &CellType,
     for_output: bool,
 ) -> PhonyFile {
-    // Not sure why we need to reverse for the desired formatting, but there you go
     let path_buf: PathBuf = match for_output {
-        false => [format!("Cell {idx}"), format!("({:#?})", cell_type)]
+        false => [format!("Cell {idx}"), format!("({:#?})  ", cell_type)]
             .iter()
             .rev()
             .map(|s| s.as_str())
             .collect(),
-        true => [format!("Cell {idx}"), "[Output]".to_string()]
+        true => [format!("[Output — Cell {:#?}]", idx)]
             .iter()
-            .rev()
             .map(|s| s.as_str())
             .collect(),
     };
@@ -195,6 +193,9 @@ impl CellBuilder {
                         log::debug!("Cell output value: {:#?}", val);
                         let outputs = serde_json::from_value::<Option<Vec<IpynbCodeOutput>>>(val)?;
                         log::debug!("Parsed cell output as: {:#?}", outputs);
+
+                        // TODO: Organize output-type specific handlers
+                        // TODO: Try creating output buffers here
                         this.outputs = outputs;
                         this.output_actions = match this.outputs.as_deref() {
                             Some([]) => None,
