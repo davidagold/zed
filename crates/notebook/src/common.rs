@@ -20,3 +20,22 @@ where
         err
     })
 }
+
+/// Small utility to tidy working in a closure.
+/// ```
+/// do_in!(|| -> T { ... })
+///
+/// // Equivalent to
+/// // (|| -> T {
+/// //     { ... }.into()
+/// // })()
+/// ```
+#[macro_export]
+macro_rules! do_in {
+    (|| -> $ret:ty $body:block) => {{
+        (|| -> $ret {
+            //
+            { $body }.into()
+        })()
+    }};
+}
