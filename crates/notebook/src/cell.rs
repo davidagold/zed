@@ -1,4 +1,5 @@
 // use crate::common::python_lang;
+use crate::do_in;
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use editor::{ExcerptId, ExcerptRange};
@@ -14,21 +15,6 @@ use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{SumTree, Summary};
 use ui::Context;
 
-use crate::do_in;
-
-#[derive(Clone, Debug)]
-pub struct Cell {
-    pub id: CellId,
-    // `cell_id` is a notebook field
-    pub cell_id: Option<String>,
-    pub cell_type: CellType,
-    pub metadata: HashMap<String, serde_json::Value>,
-    pub source: Model<Buffer>,
-    pub execution_count: Option<usize>,
-    pub outputs: Option<Vec<IpynbCodeOutput>>,
-    pub output_content: Option<Model<Buffer>>,
-}
-
 pub fn excerpt_range_over_buffer<M>(
     buffer: &Model<Buffer>,
     cx: &ModelContext<M>,
@@ -39,25 +25,6 @@ pub fn excerpt_range_over_buffer<M>(
             end: buffer.read(cx).len() as _,
         },
         primary: None,
-    }
-}
-
-impl Cell {}
-
-pub struct CellBuilder {
-    id: u64,
-    cell_id: Option<String>,
-    cell_type: Option<CellType>,
-    metadata: Option<HashMap<String, serde_json::Value>>,
-    source: Option<Model<Buffer>>,
-    execution_count: Option<usize>,
-    outputs: Option<Vec<IpynbCodeOutput>>,
-    output_content: Option<Model<Buffer>>,
-}
-
-impl Debug for CellBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`cell_id`: {:#?}", self.cell_id)
     }
 }
 
@@ -140,32 +107,60 @@ pub(crate) fn title_for_cell_excerpt(
     }
 }
 
-impl CellBuilder {
-    pub fn new(
-        project_handle: &mut WeakModel<Project>,
-        cx: &mut AsyncAppContext,
-        id: u64,
-        map: serde_json::Map<String, serde_json::Value>,
-    ) -> CellBuilder {
-        let mut this = CellBuilder {
-            id,
-            cell_id: None,
-            cell_type: None,
-            metadata: None,
-            source: None,
-            execution_count: None,
-            outputs: None,
-            output_content: None,
-        };
+#[derive(Clone, Debug)]
+pub struct Cell {
+    pub id: CellId,
+    // `cell_id` is a notebook field
+    pub cell_id: Option<String>,
+    pub cell_type: CellType,
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub source: Model<Buffer>,
+    pub execution_count: Option<usize>,
+    pub outputs: Option<Vec<IpynbCodeOutput>>,
+    pub output_content: Option<Model<Buffer>>,
+}
 
+#[derive(Default)]
+pub struct CellBuilder {
+    id: u64,
+    cell_id: Option<String>,
+    cell_type: Option<CellType>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    source: Option<Model<Buffer>>,
+    execution_count: Option<usize>,
+    outputs: Option<Vec<IpynbCodeOutput>>,
+    output_content: Option<Model<Buffer>>,
+}
+
+impl Debug for CellBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`cell_id`: {:#?}", self.cell_id)
+    }
+}
+
+impl CellBuilder {
+    pub fn new(id: u64) -> CellBuilder {
+        CellBuilder {
+            id,
+            ..CellBuilder::default()
+        }
+    }
+
+    pub fn build(
+        mut self,
+        project_handle: &mut WeakModel<Project>,
+        map: serde_json::Map<String, serde_json::Value>,
+        cx: &mut AsyncAppContext,
+    ) -> Cell {
         for (key, val) in map {
+            // Work in a closure to propagate errors without returning early
             let result_parse_entry = do_in!(|| -> Result<_> {
                 match key.as_str() {
-                    "cell_id" => this.cell_id = val.as_str().map(|s| s.to_string()),
+                    "cell_id" => self.cell_id = val.as_str().map(|s| s.to_string()),
                     "cell_type" => {
-                        this.cell_type = serde_json::from_value(val).unwrap_or_default();
+                        self.cell_type = serde_json::from_value(val).unwrap_or_default();
                     }
-                    "metadata" => this.metadata = serde_json::from_value(val).unwrap_or_default(),
+                    "metadata" => self.metadata = serde_json::from_value(val).unwrap_or_default(),
                     "source" => {
                         let source_lines: Vec<String> = match val {
                             serde_json::Value::String(src) => Ok([src].into()),
@@ -194,14 +189,14 @@ impl CellBuilder {
                                     project_cx,
                                 )?;
 
-                                this.source.replace(source_buffer);
+                                self.source.replace(source_buffer);
                                 Ok(())
                             })
                             .flatten()?;
                     }
                     "execution_count" => {
                         // TODO: Handle this more carefully
-                        this.execution_count = serde_json::from_value(val).unwrap_or_default()
+                        self.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
                     "outputs" => {
                         // TODO: Validate `cell_type == 'code'`
@@ -210,16 +205,15 @@ impl CellBuilder {
                         log::debug!("Parsed cell output as: {:#?}", outputs);
 
                         // TODO: Organize output-type specific handlers
-                        // TODO: Try creating output buffers here
-                        this.outputs = outputs;
-                        this.output_content = match this.outputs.as_deref() {
+                        self.outputs = outputs;
+                        self.output_content = match self.outputs.as_deref() {
                             Some([]) => None,
                             Some(outputs) => {
                                 // TODO: Generic over MIME type and other display options
                                 let title = title_for_cell_excerpt(
-                                    this.id.into(),
-                                    this.cell_id.as_ref(),
-                                    this.cell_type.as_ref().unwrap_or(&CellType::Raw),
+                                    self.id.into(),
+                                    self.cell_id.as_ref(),
+                                    self.cell_type.as_ref().unwrap_or(&CellType::Raw),
                                     true,
                                 );
                                 OutputHandler::try_as_buffer(outputs.iter(), title, cx)
@@ -230,11 +224,12 @@ impl CellBuilder {
                     _ => {}
                 };
 
-                let cell_id = this.cell_id.clone();
-                let cell_type = this.cell_type.clone();
+                let cell_id = self.cell_id.clone();
+                let cell_type = self.cell_type.clone();
                 do_in!(|| -> Option<_> {
-                    let title = title_for_cell_excerpt(id, (&cell_id).as_ref(), &cell_type?, false);
-                    if let Some(buffer_handle) = &this.source {
+                    let title =
+                        title_for_cell_excerpt(self.id, (&cell_id).as_ref(), &cell_type?, false);
+                    if let Some(buffer_handle) = &self.source {
                         cx.update_model(&buffer_handle, |buffer, cx| {
                             buffer.file_updated(Arc::new(title), cx);
                         })
@@ -255,11 +250,7 @@ impl CellBuilder {
             }
         }
 
-        this
-    }
-
-    pub fn build(self) -> Cell {
-        let cell = Cell {
+        Cell {
             id: CellId(self.id),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
@@ -268,9 +259,7 @@ impl CellBuilder {
             execution_count: self.execution_count,
             outputs: self.outputs,
             output_content: self.output_content,
-        };
-
-        cell
+        }
     }
 }
 
@@ -490,7 +479,7 @@ impl OutputHandler {
         //       to concatenate multiple outputs.
         let content = outputs
             .filter_map(|o| -> Option<OutputHandler> { o.try_into().ok() })
-            .map(|h: OutputHandler| h.as_rope())
+            .map(|h| h.as_rope())
             .fold(Rope::new(), |mut base, content| {
                 if content.is_none() {
                     return base;
