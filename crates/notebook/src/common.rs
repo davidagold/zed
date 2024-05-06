@@ -9,7 +9,6 @@ pub(crate) fn parse_value<T: DeserializeOwned, E: serde::de::Error>(
     serde_json::from_value::<T>(val).map_err(|err| E::custom(err.to_string()))
 }
 
-// TODO: For cleaning things up
 pub(crate) fn forward_err_with<'f, E, F>(format: F) -> Box<dyn FnOnce(E) -> anyhow::Error + 'f>
 where
     E: Into<anyhow::Error>,
