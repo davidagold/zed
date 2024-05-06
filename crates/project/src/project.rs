@@ -3086,7 +3086,7 @@ impl Project {
         }
     }
 
-    pub fn start_language_servers(
+    fn start_language_servers(
         &mut self,
         worktree: &Model<Worktree>,
         language: Arc<Language>,

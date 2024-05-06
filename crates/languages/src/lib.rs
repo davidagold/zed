@@ -241,7 +241,7 @@ pub fn init(
     .detach();
 }
 
-// #[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support"))]
 pub fn language(name: &str, grammar: tree_sitter::Language) -> Arc<Language> {
     Arc::new(
         Language::new(load_config(name), Some(grammar))
