@@ -1,22 +1,24 @@
 //! Jupyter support for Zed.
 
+use collections::HashMap;
 use editor::{
     items::entry_label_color, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer,
     MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, HighlightStyle, Model,
-    ParentElement, Subscription, View,
+    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    Subscription, View,
 };
-use itertools::Itertools;
-use language::{self, Buffer, Capability, HighlightId};
+use language::{self, Buffer, Capability};
+use log::info;
 use project::{self, Project};
+use rope::Rope;
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
     ops::Range,
+    sync::Arc,
 };
-use theme::{ActiveTheme, SyntaxTheme};
 use ui::{
     div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
     SharedString, Styled, ViewContext, VisualContext,
@@ -27,7 +29,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellId},
+    cell::{cell_tab_title, CellId},
     Notebook,
 };
 
@@ -40,41 +42,72 @@ pub struct NotebookEditor {
 
 impl NotebookEditor {
     fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let cells = notebook
-            .read(cx)
-            .cells
+        let cells = notebook.read(cx).cells.clone();
+
+        let mut output_buffers_by_id: HashMap<CellId, Model<Buffer>> = cells
             .iter()
-            .map(|cell| cell.clone())
-            .collect_vec();
+            .filter_map(|cell| {
+                let mut output_text = Rope::new();
+                for action in cell.output_actions.as_ref()? {
+                    output_text.append(action.as_rope()?);
+                }
+                let buffer = cx.new_model(|cx| {
+                    let title = cell_tab_title(
+                        cell.id.into(),
+                        cell.cell_id.as_ref(),
+                        &cell.cell_type,
+                        true,
+                    );
+                    let mut buffer = Buffer::local(output_text.to_string(), cx);
+                    buffer.file_updated(Arc::from(title), cx);
+                    buffer
+                });
+                Some((cell.id, buffer))
+            })
+            .collect();
+
+        info!("{:#?}", output_buffers_by_id);
 
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-            for (cell, range) in cells
-                .into_iter()
-                .map(|cell| {
-                    let range = ExcerptRange {
-                        context: Range {
-                            start: 0 as usize,
-                            end: cell.source.read(model_cx).len() as _,
-                        },
-                        primary: None,
-                    };
-                    (cell, range)
-                })
-                .collect_vec()
-            {
-                let id: u64 = cell.id.into();
-                let prev_excerpt_id = if id == 1 {
-                    ExcerptId::min()
-                } else {
-                    ExcerptId::from_proto(id - 1)
+
+            let mut prev_excerpt_id = ExcerptId::min();
+            for cell in cells.iter() {
+                let id: u64 = prev_excerpt_id.to_proto() + 1;
+
+                // Handle source buffer
+                let range = ExcerptRange {
+                    context: Range {
+                        start: 0 as usize,
+                        end: cell.source.read(model_cx).len() as _,
+                    },
+                    primary: None,
                 };
                 multi.insert_excerpts_with_ids_after(
                     prev_excerpt_id,
-                    cell.source,
-                    vec![(cell.id.into(), range)],
+                    cell.source.clone(),
+                    vec![(ExcerptId::from_proto(id), range)],
                     model_cx,
                 );
+                prev_excerpt_id = ExcerptId::from_proto(id);
+
+                // Handle output buffer if present
+                if let Some(output_buffer) = output_buffers_by_id.remove(&cell.id) {
+                    let range = ExcerptRange {
+                        context: Range {
+                            start: 0 as usize,
+                            end: output_buffer.read(model_cx).len() as _,
+                        },
+                        primary: None,
+                    };
+                    multi.insert_excerpts_with_ids_after(
+                        prev_excerpt_id,
+                        output_buffer,
+                        vec![(ExcerptId::from_proto(id + 1), range)],
+                        model_cx,
+                    );
+                    prev_excerpt_id = ExcerptId::from_proto(id + 1);
+                }
             }
 
             multi
@@ -105,7 +138,12 @@ impl NotebookEditor {
 
         cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
             cx.emit(event.clone());
-            log::info!("Event: {:#?}", event);
+            match event {
+                EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                _ => {
+                    log::info!("Event: {:#?}", event);
+                }
+            }
         })
         .detach();
 
@@ -118,103 +156,6 @@ impl NotebookEditor {
 
         this
     }
-
-    fn highlight_syntax(
-        &mut self,
-        only_for_excerpt_ids: Option<Vec<ExcerptId>>,
-        cx: &mut ViewContext<NotebookEditor>,
-    ) {
-        let mut highlights_by_range = Vec::<(Range<usize>, HighlightId)>::default();
-
-        self.editor.update(cx, |editor, cx| {
-            editor.buffer().read_with(cx, |multi, cx| {
-                // This is somewhat inefficient but OK for now.
-                multi.for_each_buffer(|buffer_handle| {
-                    if only_for_excerpt_ids.is_some()
-                        && (!only_for_excerpt_ids.as_ref().unwrap().iter().any(|id| {
-                            multi
-                                .excerpts_for_buffer(buffer_handle, cx)
-                                .iter()
-                                .map(|(id, _)| id)
-                                .contains(id)
-                        }))
-                    {
-                        return;
-                    }
-                    buffer_handle.read_with(cx, |buffer, cx| {
-                        highlights_by_range.extend(self.get_highlight_ids_for_buffer(buffer, cx)?);
-                        Some(())
-                    });
-                });
-            });
-        });
-
-        self.editor.update(cx, |editor, cx| {
-            let styles_by_range = NotebookEditor::get_highlight_styles_for_multi(
-                editor,
-                highlights_by_range,
-                &only_for_excerpt_ids,
-                cx,
-            );
-
-            for (rng, style) in styles_by_range {
-                editor.highlight_text::<NotebookEditor>(vec![rng], style, cx);
-            }
-        });
-    }
-
-    fn get_highlight_ids_for_buffer(
-        &self,
-        buffer: &Buffer,
-        cx: &AppContext,
-    ) -> Option<Vec<(Range<usize>, HighlightId)>> {
-        let lang = self.notebook.read(cx).language.clone()?;
-        let highlights_by_range = lang
-            .highlight_text(buffer.as_rope(), 0..buffer.len())
-            .into_iter()
-            .collect_vec();
-
-        Some(highlights_by_range)
-    }
-
-    fn get_highlight_styles_for_multi<T>(
-        editor: &Editor,
-        highlights_by_range: Vec<(Range<usize>, HighlightId)>,
-        only_for_excerpt_ids: &Option<Vec<ExcerptId>>,
-        cx: &ViewContext<T>,
-    ) -> Vec<(Range<multi_buffer::Anchor>, HighlightStyle)> {
-        let multi = editor.buffer().read(cx);
-        let syntax = cx.theme().syntax().as_ref().clone();
-
-        highlights_by_range
-            .iter()
-            .flat_map(|(range, h)| {
-                multi
-                    .range_to_buffer_ranges(range.clone(), cx)
-                    .iter()
-                    .filter_map(|(_buffer, range, excerpt_id)| {
-                        if only_for_excerpt_ids.is_some()
-                            && (!only_for_excerpt_ids
-                                .as_ref()
-                                .unwrap()
-                                .iter()
-                                .any(|id| id == excerpt_id))
-                        {
-                            return None;
-                        }
-                        let range = Range {
-                            start: multi.snapshot(cx).anchor_before(range.start),
-                            end: multi.snapshot(cx).anchor_before(range.end),
-                        };
-                        let style = h.style(&syntax)?;
-                        Some((range, style))
-                    })
-                    .collect_vec()
-            })
-            .collect_vec()
-    }
-
-    fn expand_output_cells<V>(&mut self, cx: &mut ViewContext<V>) {}
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
         let (excerpt_id, buffer_handle, _range) = match self.editor.read(cx).active_excerpt(cx) {
@@ -355,9 +296,7 @@ impl workspace::item::ProjectItem for NotebookEditor {
     where
         Self: Sized,
     {
-        let mut nb_editor = NotebookEditor::new(project, notebook, cx);
-        nb_editor.highlight_syntax(None, cx);
-        nb_editor
+        NotebookEditor::new(project, notebook, cx)
     }
 }
 
