@@ -41,7 +41,7 @@ impl Notebook {
         &mut self,
         project: &WeakModel<Project>,
         cx: &mut AsyncAppContext,
-    ) -> anyhow::Result<Option<Arc<Language>>> {
+    ) -> anyhow::Result<()> {
         let Some(kernel_spec) = (&self.metadata).as_ref().and_then(|metadata| {
             log::info!("NotebookBuilder.metadata: {:#?}", metadata);
             serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
@@ -54,18 +54,14 @@ impl Notebook {
         let cloned_project = project.clone();
         let language = cx
             .spawn(|cx| async move {
-                let language = match kernel_spec.language.as_str() {
+                match kernel_spec.language.as_str() {
                     "python" => cloned_project.read_with(&cx, |project, cx| {
                         let languages = project.languages();
-                        log::info!("Available languages: {:#?}", languages.language_names());
-
                         languages.language_for_name("Python")
                     }),
                     _ => Err(anyhow::anyhow!("Failed to get language")),
                 }?
-                .await;
-
-                language
+                .await
             })
             .await;
 
@@ -88,10 +84,8 @@ impl Notebook {
                 ),
             }
         });
-        match &self.language {
-            Some(lang) => Ok(Some(lang.clone())),
-            None => Ok(None),
-        }
+
+        Ok(())
     }
 }
 
@@ -133,7 +127,7 @@ impl<'cx> NotebookBuilder<'cx> {
             cells: self.cells,
         };
 
-        notebook
+        let _ = notebook
             .try_set_source_languages(&self.project_handle, &mut self.cx)
             .await;
 
