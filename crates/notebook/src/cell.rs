@@ -1,8 +1,8 @@
 // use crate::common::python_lang;
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::ExcerptId;
-use gpui::{AppContext, AsyncAppContext, Flatten, Model, WeakModel};
+use editor::{ExcerptId, ExcerptRange};
+use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::Itertools;
 use language::{Buffer, File};
 use project::Project;
@@ -26,7 +26,19 @@ pub struct Cell {
     pub source: Model<Buffer>,
     pub execution_count: Option<usize>,
     pub outputs: Option<Vec<IpynbCodeOutput>>,
-    pub output_actions: Option<Vec<OutputHandler>>,
+    pub output_content: Option<Vec<Model<Buffer>>>,
+}
+
+impl Cell {
+    pub fn excerpt_range<M>(&self, cx: &ModelContext<M>) -> ExcerptRange<usize> {
+        ExcerptRange {
+            context: std::ops::Range {
+                start: 0 as usize,
+                end: self.source.read(cx).len() as _,
+            },
+            primary: None,
+        }
+    }
 }
 
 pub struct CellBuilder {
@@ -37,7 +49,7 @@ pub struct CellBuilder {
     source: Option<Model<Buffer>>,
     execution_count: Option<usize>,
     outputs: Option<Vec<IpynbCodeOutput>>,
-    output_actions: Option<Vec<OutputHandler>>,
+    output_content: Option<Vec<Model<Buffer>>>,
 }
 
 impl Debug for CellBuilder {
@@ -140,7 +152,7 @@ impl CellBuilder {
             source: None,
             execution_count: None,
             outputs: None,
-            output_actions: None,
+            output_content: None,
         };
 
         for (key, val) in map {
@@ -197,41 +209,30 @@ impl CellBuilder {
                         // TODO: Organize output-type specific handlers
                         // TODO: Try creating output buffers here
                         this.outputs = outputs;
-                        this.output_actions = match this.outputs.as_deref() {
+                        this.output_content = match this.outputs.as_deref() {
                             Some([]) => None,
                             Some(outputs) => {
-                                let output_actions = outputs
-                                    .iter()
-                                    .filter_map(|output| {
-                                        use IpynbCodeOutput::*;
-                                        match output {
-                                            Stream { name, text } => {
-                                                log::info!("Output text: {:#?}", text);
-                                                match name {
-                                                    StreamOutputTarget::Stdout => Some(
-                                                        OutputHandler::print(Some(text.clone())),
-                                                    ),
-                                                    StreamOutputTarget::Stderr => {
-                                                        Some(OutputHandler::print(None))
-                                                    }
-                                                }
-                                            }
-                                            DisplayData { data, metadata } => {
-                                                Some(OutputHandler::print(None))
-                                            }
-                                            ExecutionResult {
-                                                // TODO: Handle MIME types here
-                                                execution_count,
-                                                data,
-                                                metadata,
-                                            } => Some(OutputHandler::print(None)),
-                                        }
-                                    })
-                                    .collect_vec();
-                                Some(output_actions)
+                                Some(
+                                    outputs
+                                        .iter()
+                                        .flat_map(|output| {
+                                            outputs.iter().filter_map(|o| o.try_into().ok())
+                                        })
+                                        .filter_map(|handler: OutputHandler| {
+                                            // TODO: Generic over MIME type and other display options
+                                            let title = cell_tab_title(
+                                                this.id.into(),
+                                                this.cell_id.as_ref(),
+                                                this.cell_type.as_ref().unwrap_or(&CellType::Raw),
+                                                true,
+                                            );
+                                            handler.to_buffer(title, cx)
+                                        })
+                                        .collect_vec(),
+                                )
                             }
                             None => None,
-                        };
+                        }
                     }
                     _ => {}
                 };
@@ -274,7 +275,7 @@ impl CellBuilder {
             source: self.source.unwrap(),
             execution_count: self.execution_count,
             outputs: self.outputs,
-            output_actions: self.output_actions,
+            output_content: self.output_content,
         };
 
         cell
@@ -453,6 +454,7 @@ pub enum OutputHandler {
     Print(Option<String>),
 }
 
+// Attempt to decouble cell data model (including MIME output) from the means by which it is displayed.
 impl OutputHandler {
     pub fn print(text: Option<StreamOutputText>) -> OutputHandler {
         use StreamOutputText::*;
@@ -469,6 +471,10 @@ impl OutputHandler {
         }
     }
 
+    pub fn to_media() {
+        unimplemented!()
+    }
+
     pub fn as_rope(&self) -> Option<Rope> {
         let OutputHandler::Print(Some(text)) = self else {
             return None;
@@ -478,11 +484,17 @@ impl OutputHandler {
         Some(out)
     }
 
-    pub fn to_output_buffer(self, cx: &mut ViewContext<NotebookEditor>) -> Option<Model<Buffer>> {
+    pub fn to_buffer(self, title: PhonyFile, cx: &mut AsyncAppContext) -> Option<Model<Buffer>> {
+        // TODO: Why do we reduce to a single string before this point?
         let OutputHandler::Print(Some(text)) = self else {
             return None;
         };
-        Some(cx.new_model(|cx| Buffer::local(text, cx)))
+        cx.new_model(|cx| {
+            let mut buffer = Buffer::local(text, cx);
+            buffer.file_updated(Arc::from(title), cx);
+            buffer
+        })
+        .ok()
     }
 }
 
@@ -494,4 +506,28 @@ pub struct KernelSpec {
     pub interrup_mode: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub metadata: Option<HashMap<String, Value>>,
+}
+
+impl TryFrom<&IpynbCodeOutput> for OutputHandler {
+    type Error = anyhow::Error;
+
+    fn try_from(output: &IpynbCodeOutput) -> anyhow::Result<Self> {
+        use IpynbCodeOutput::*;
+        match output {
+            Stream { name, text } => {
+                log::info!("Output text: {:#?}", text);
+                match name {
+                    StreamOutputTarget::Stdout => Ok(OutputHandler::print(Some(text.clone()))),
+                    StreamOutputTarget::Stderr => Ok(OutputHandler::print(None)),
+                }
+            }
+            DisplayData { data, metadata } => Ok(OutputHandler::print(None)),
+            ExecutionResult {
+                // TODO: Handle MIME types here
+                execution_count,
+                data,
+                metadata,
+            } => Ok(OutputHandler::print(None)),
+        }
+    }
 }
