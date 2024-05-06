@@ -4,7 +4,7 @@ mod common;
 pub mod editor;
 
 use crate::cell::{Cells, KernelSpec};
-use crate::common::parse_value;
+use crate::common::{forward_err_with, parse_value};
 use anyhow::anyhow;
 use cell::CellBuilder;
 use collections::HashMap;
@@ -37,7 +37,7 @@ impl Notebook {
         })
     }
 
-    async fn try_set_language<'cx>(
+    async fn try_set_source_languages<'cx>(
         &mut self,
         project: &WeakModel<Project>,
         cx: &mut AsyncAppContext,
@@ -69,20 +69,27 @@ impl Notebook {
             })
             .await;
 
-        self.language = language.ok();
-        match &self.language {
-            Some(lang) => {
+        self.language = language.ok().inspect(|lang| {
+            match (|| -> anyhow::Result<()> {
                 let handle = &project
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("Cannot upgrade project"))?;
+
                 cx.update_model(handle, |project, cx| {
                     for cell in self.cells.iter() {
-                        log::info!("Setting language {:#?} for buffer {:#?}", lang, cell.source);
                         project.set_language_for_buffer(&cell.source, lang.clone(), cx)
                     }
-                })?;
-                Ok(Some(lang.clone()))
+                })
+            })() {
+                Ok(_) => log::info!("Successfully set languages for all source buffers"),
+                Err(err) => error!(
+                    "Failed to set language for at least one source buffer: {:#?}",
+                    err
+                ),
             }
+        });
+        match &self.language {
+            Some(lang) => Ok(Some(lang.clone())),
             None => Ok(None),
         }
     }
@@ -125,8 +132,9 @@ impl<'cx> NotebookBuilder<'cx> {
             nbformat_minor: self.nbformat_minor.unwrap(),
             cells: self.cells,
         };
+
         notebook
-            .try_set_language(&self.project_handle, &mut self.cx)
+            .try_set_source_languages(&self.project_handle, &mut self.cx)
             .await;
 
         notebook
@@ -252,20 +260,22 @@ impl project::Item for Notebook {
 
                     (bytes, file)
                 })
-                .map_err(|err| {
-                    let err = anyhow!(
+                .map_err(forward_err_with(|err| {
+                    format!(
                         "Failed to read notebook from notebook file `{:#?}`: {:#?}",
-                        cloned_path,
-                        err
-                    );
-                    log::error!("{err}");
-                    err
-                })?;
+                        cloned_path, err
+                    )
+                }))?;
 
             let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
             let builder = NotebookBuilder::new(project_clone, file, &mut cx)
                 .deserialize(&mut deserializer)
-                .map_err(|err| anyhow!(err.to_string()))?;
+                .map_err(forward_err_with(|err| {
+                    format!(
+                        "Failed to deserialize notebook from path `{:#?}`: {:#?}",
+                        cloned_path, err
+                    )
+                }))?;
 
             let notebook = builder.build().await;
             cx.new_model(move |_| notebook)
