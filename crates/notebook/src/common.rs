@@ -32,6 +32,20 @@ where
 /// ```
 #[macro_export]
 macro_rules! do_in {
+    (|| $body:expr) => {{
+        (|| -> Option<_> {
+            //
+            { $body }.into()
+        })()
+    }};
+
+    (|| $body:block) => {{
+        (|| -> Option<_> {
+            //
+            { $body }.into()
+        })()
+    }};
+
     (|| -> $ret:ty $body:block) => {{
         (|| -> $ret {
             //

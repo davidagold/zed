@@ -2,15 +2,20 @@ pub mod actions;
 pub mod cell;
 mod common;
 pub mod editor;
+mod kernel;
 
 use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
+use crate::kernel::TryAsStr;
 use anyhow::anyhow;
 use cell::CellBuilder;
 use collections::HashMap;
 use gpui::{AsyncAppContext, Context, WeakModel};
+use kernel::JupyterKernelClient;
 use language::Language;
 use log::{error, info};
+use pyo3::types::PyAnyMethods;
+use pyo3::{PyResult, Python};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use serde_json::Value;
 use std::{io::Read, num::NonZeroU64, sync::Arc};
@@ -28,6 +33,7 @@ pub struct Notebook {
     pub nbformat: usize,
     pub nbformat_minor: usize,
     pub cells: Cells,
+    pub kernel_client: Option<Arc<JupyterKernelClient>>,
 }
 
 impl Notebook {
@@ -37,7 +43,13 @@ impl Notebook {
         })
     }
 
-    async fn try_set_source_languages<'cx>(
+    async fn try_set_kernel_client(&mut self, cx: &AsyncAppContext) -> anyhow::Result<()> {
+        let kc = JupyterKernelClient::new(cx).await?;
+        self.kernel_client.replace(Arc::new(kc));
+        Ok(())
+    }
+
+    async fn try_set_source_languages(
         &mut self,
         project: &WeakModel<Project>,
         cx: &mut AsyncAppContext,
@@ -46,7 +58,7 @@ impl Notebook {
             log::info!("NotebookBuilder.metadata: {:#?}", metadata);
             serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
         }) else {
-            return Err(anyhow::anyhow!("No kernel spec"));
+            return Err(anyhow!("No kernel spec"));
         };
 
         log::info!("kernel_spec: {:#?}", kernel_spec);
@@ -59,7 +71,7 @@ impl Notebook {
                         let languages = project.languages();
                         languages.language_for_name("Python")
                     }),
-                    _ => Err(anyhow::anyhow!("Failed to get language")),
+                    _ => Err(anyhow!("Failed to get language")),
                 }?
                 .await
             })
@@ -69,7 +81,7 @@ impl Notebook {
             match do_in!(|| -> anyhow::Result<()> {
                 let handle = &project
                     .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("Cannot upgrade project"))?;
+                    .ok_or_else(|| anyhow!("Cannot upgrade project"))?;
 
                 cx.update_model(handle, |project, cx| {
                     for cell in self.cells.iter() {
@@ -125,6 +137,7 @@ impl<'cx> NotebookBuilder<'cx> {
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
             cells: self.cells,
+            kernel_client: None,
         };
 
         let _ = notebook
@@ -225,7 +238,7 @@ impl project::Item for Notebook {
                 .update(&mut cx, |project, cx| {
                     project.open_buffer(cloned_path.clone(), cx)
                 })
-                .map_err(|err| anyhow::anyhow!("Failed to open file: {:#?}", err))?
+                .map_err(|err| anyhow!("Failed to open file: {:#?}", err))?
                 .await
                 .inspect(|_| {
                     info!(
@@ -270,7 +283,39 @@ impl project::Item for Notebook {
                     )
                 }))?;
 
-            let notebook = builder.build().await;
+            let mut notebook = builder.build().await;
+
+            pyo3::prepare_freethreaded_python();
+            if let Err(err) = Python::with_gil(|py| -> PyResult<_> {
+                let sys = py.import_bound("sys")?;
+                let version = sys.getattr("version")?;
+                do_in!(|| info!("Found Python version: {}", version.__str__()?));
+
+                // let insert = sys.getattr("path")?.getattr("insert")?;
+                // let additional_paths = [&(pwd.to_str().unwrap().to_string())];
+                // for path in self.pythonpath.iter().chain(additional_paths) {
+                //     insert.call((0, path), None)?;
+                // }
+
+                do_in!(|| info!(
+                    "Python executable: {}",
+                    sys.getattr("executable").ok()?.__str__()?
+                ));
+
+                let pythonpath = sys.getattr("path")?.extract::<Vec<String>>()?;
+                let str_python_path = serde_json::to_string_pretty(&pythonpath)
+                    .expect("Failed to serialize `sys.path`.");
+
+                info!("Found Python path: {str_python_path}");
+                info!("{}", str_python_path.as_str());
+
+                Ok(())
+            }) {
+                error!("{}", format!("Failed to initialize Python process: {err}"));
+                return Err(err.into());
+            };
+            notebook.try_set_kernel_client(&cx).await?;
+
             cx.new_model(move |_| notebook)
         });
 
