@@ -39,6 +39,14 @@ macro_rules! do_in {
         })()
     }};
 
+    (|$py:ident $(:Python)?| $body:expr) => {{
+        Python::with_gil(|py| (|$py: Python| $body)(py))
+    }};
+
+    (|$py:ident| -> $ret:ty $body:block) => {{
+        Python::with_gil(|py| -> $ret { (|$py: Python| $body)(py) })
+    }};
+
     (|| $body:block) => {{
         (|| -> Option<_> {
             //

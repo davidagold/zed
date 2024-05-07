@@ -307,7 +307,6 @@ impl project::Item for Notebook {
                     .expect("Failed to serialize `sys.path`.");
 
                 info!("Found Python path: {str_python_path}");
-                info!("{}", str_python_path.as_str());
 
                 Ok(())
             }) {
