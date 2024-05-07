@@ -168,7 +168,12 @@ impl JupyterKernelClient {
         let mut handler = ResultSender::new();
         let rx = handler.rx.take().ok_or_else(|| anyhow!("Nope"))?;
 
-        let km = PyPath::new(module_name, vec!["manager", "AsyncKernelManager"]).into_py()?;
+        let km = Python::with_gil(|py| {
+            PyPath::new(module_name, vec!["manager", "AsyncKernelManager"])
+                .into_py()
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+                .call_bound(py, (), None)
+        })?;
         do_in!(|| info!("Initialized `AsyncKernelManager` {}", km.__str__()?));
 
         let kc = Python::with_gil(|py| -> PyResult<_> {
@@ -176,8 +181,8 @@ impl JupyterKernelClient {
             let kernel_id = PyString::new_bound(py, "python3");
             let kwargs = kwargs!(py, { "kernel_id" => kernel_id })?;
 
-            km.call_method_bound(py, "start_kernel", (&km,), Some(&kwargs))?;
-            let kc = km.call_method_bound(py, "client", (&km,), Some(&kwargs))?;
+            km.call_method_bound(py, "start_kernel", (), Some(&kwargs))?;
+            let kc = km.call_method_bound(py, "client", (), Some(&kwargs))?;
             kc.call_method_bound(py, "wait_for_ready", (&kc,), None)?;
 
             Ok(kc)
