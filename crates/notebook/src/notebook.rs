@@ -318,7 +318,10 @@ impl project::Item for Notebook {
                 error!("{}", format!("Failed to initialize Python process: {err}"));
                 return Err(err.into());
             };
-            notebook.try_set_kernel_client(&cx).await?;
+            notebook
+                .try_set_kernel_client(&cx)
+                .await
+                .map_err(forward_err_with(|err: anyhow::Error| err.to_string()))?;
 
             cx.new_model(move |_| notebook)
         });
