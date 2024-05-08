@@ -36,7 +36,7 @@ use crate::{
 
 //     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 //         let waker = cx.waker();
-//         Python::with_gil(|gil| {
+//         pyo3::with_embedded_python_interpreter(|gil| {
 //             gil.allow_threads(|| pin!(&mut self.0).poll(&mut Context::from_waker(waker)))
 //         })
 //     }
@@ -67,7 +67,7 @@ pub(crate) trait TryAsStr {
 
 impl TryAsStr for Py<PyAny> {
     fn __str__(&self) -> Option<String> {
-        Python::with_gil(|py| -> Option<String> {
+        do_in!(|py| -> Option<String> {
             let method = self.getattr(py, PyString::new_bound(py, "__str__")).ok()?;
             let result = method.call_bound(py, (), None).ok()?;
             let py_string = result.downcast_bound::<PyString>(py).ok()?;
@@ -108,7 +108,7 @@ impl PyPath {
     }
 
     pub fn into_py(self) -> anyhow::Result<Py<PyAny>> {
-        Python::with_gil(|py| self.into_bound(py).map(|py_any| py_any.unbind()))
+        do_in!(|py| { self.into_bound(py).map(|py_any| py_any.unbind()) })
     }
 }
 
@@ -117,88 +117,59 @@ pub struct JupyterKernelClient {
 }
 
 #[pyclass]
-struct Awaitable {
-    result_tx: Option<oneshot::Sender<Py<PyAny>>>,
-    awaitable: Option<Py<PyAny>>,
-    callback_rx: oneshot::Receiver<Py<PyAny>>,
+struct Coroutine {
+    awaitable: Py<PyAny>,
+    tx: Option<oneshot::Sender<PyResult<Py<PyAny>>>>,
 }
 
 #[pymethods]
-impl Awaitable {
+impl Coroutine {
     #[pyo3(signature = ())]
-    // pub fn __call__<'py>(&'py mut self) -> PyResult<&'py Bound<PyAny>> {
-    pub fn __call__<'py>(&'py mut self) -> PyResult<Py<PyAny>> {
-        do_in!(|py| {
-            let ensure_future = py.import_bound("asyncio")?.getattr("ensure_future")?;
-            let awaitable = self
-                .awaitable
-                .take()
-                .ok_or_else(|| PyRuntimeError::new_err("nope"))?;
-
-            info!("Got awaitable");
-
-            let task = ensure_future.call1((awaitable,))?;
-            info!("Ensured future");
-            self.try_add_done_callback(task.unbind())
-        })
+    fn __call__(&self) -> &Py<PyAny> {
+        &self.awaitable
     }
 
     fn try_add_done_callback<'py>(
-        &'py mut self,
-        // task: &Bound<'py, PyAny>,
-        task: Py<PyAny>,
+        &'py self,
+        py: Python<'py>,
+        callback: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        info!("Trying to get callback");
-        let callback = self
-            .callback_rx
-            .try_recv()
-            .map_err(|err| PyRuntimeError::new_err("Failed to receive callback"))?;
-        info!("Got callback");
-        do_in!(|py| task.call_method1(py, "add_done_callback", (callback,)))?;
-        info!("Added callback");
-        Ok(task)
+        self.awaitable
+            .call_method1(py, "add_done_callback", (callback,))
     }
 
-    fn send_result_with(&mut self, task: Py<PyAny>) -> PyResult<()> {
-        let result = do_in!(|py| {
-            debug_assert!(task.call_method0(py, "done")?.extract(py)?);
-            task.into_py(py).call_method0(py, "result")
-        })?;
-        do_in!(|| self.result_tx.take()?.send(result));
+    fn send_result_with<'py>(&mut self, awaitable: &Bound<'_, PyAny>) -> PyResult<()> {
+        let result = awaitable.call_method0("result")?.unbind();
+        do_in!(|| self.tx.take()?.send(Ok(result)));
         Ok(())
     }
 }
 
-impl Awaitable {
+impl Coroutine {
     fn schedule<'py>(
-        awaitable: Py<PyAny>,
+        py: Python<'py>,
+        coro: Py<PyAny>,
         event_loop: &Bound<'py, PyAny>,
-    ) -> PyResult<oneshot::Receiver<Py<PyAny>>> {
-        let (result_tx, result_rx) = oneshot::channel::<Py<PyAny>>();
-        let (callback_tx, callback_rx) = oneshot::channel::<Py<PyAny>>();
-        let awaitable = do_in!(|py| -> PyResult<_> {
-            let awaitable = Awaitable {
-                awaitable: Some(do_in!(|py| awaitable.into_py(py))),
-                result_tx: Some(result_tx),
-                callback_rx,
-            }
-            .into_py(py);
-            info!("Created `Awaitable`");
+    ) -> PyResult<oneshot::Receiver<PyResult<Py<PyAny>>>> {
+        let asyncio = py.import_bound("asyncio")?;
+        let awaitable = asyncio.getattr("ensure_future")?.call1((coro,))?.unbind();
+        let add_done_callback = py
+            .import_bound("functools")?
+            .getattr("partial")?
+            .call1((awaitable.getattr(py, "add_done_callback")?,))?;
 
-            let callback = awaitable.getattr(py, "send_result_with")?;
-            info!("Got `send_result_with` method");
-            do_in!(|| -> Option<()> { callback_tx.send(callback).ok() });
+        let (tx, rx) = oneshot::channel::<PyResult<Py<PyAny>>>();
+        let coro = Coroutine {
+            awaitable,
+            tx: Some(tx),
+        }
+        .into_py(py);
 
-            Ok(awaitable)
-        })?;
+        let callback = coro.getattr(py, "send_result_with")?;
+        add_done_callback.call1((callback,))?;
+        event_loop.call_method1("run_until_complete", (coro.call0(py)?,))?;
 
-        do_in!(|py| event_loop.into_py(py).call_method1(
-            py,
-            "run_until_complete",
-            (awaitable.call0(py)?,),
-        ))?;
-
-        Ok(result_rx)
+        Ok(rx)
     }
 }
 
@@ -225,74 +196,50 @@ impl JupyterKernelClient {
         Ok(JupyterKernelClient { command_tx: tx })
     }
 
-    async fn task(mut rx: mpsc::Receiver<KernelCommand>) -> Result<()> {
+    async fn task(mut command_rx: mpsc::Receiver<KernelCommand>) -> Result<()> {
+        let startup_rx = do_in!(|py| -> PyResult<_> {
+            let asyncio = py.import_bound("asyncio")?;
+            let event_loop = asyncio.getattr("new_event_loop")?.call((), None)?;
+
+            asyncio.call_method1("set_event_loop", (&event_loop,))?;
+            // event_loop.call_method0("run_forever")?;
+            do_in!(|| info!("Event loop: {:#?}", event_loop.__str__()?));
+
+            let jupyter_client = py.import_bound("jupyter_client")?;
+
+            let ksm = jupyter_client
+                .getattr("kernelspec")?
+                .getattr("KernelSpecManager")?
+                .call0()?;
+
+            do_in!(|| info!(
+                "Initialized `KernelSpecManager` {:#?}",
+                ksm.call_method0("get_all_specs").ok()?
+            ));
+
+            let km = jupyter_client
+                .getattr("manager")?
+                .getattr("AsyncKernelManager")?
+                .call0()?;
+
+            do_in!(|| info!("Initialized `AsyncKernelManager` {:#?}", km.__str__()?));
+
+            let kernel_id = PyString::new_bound(py, "python3");
+            let kwargs = kwargs!(py, { "kernel_id" => kernel_id })?;
+            let coro = km.call_method("start_kernel", (), Some(&kwargs))?;
+            info!("Got coro");
+
+            Coroutine::schedule(py, coro.unbind(), &event_loop)
+        })
+        .map_err(forward_err_with(|err: PyErr| err.to_string()))?;
+
+        let res = startup_rx.await??;
+        do_in!(|| info!("Result: {}", res.__str__()?));
+
         loop {
-            if let Some(cmd) = rx.recv().await {
+            if let Some(cmd) = command_rx.recv().await {
                 match cmd {
-                    KernelCommand::Start { tx } => {
-                        let rx = Python::with_gil(|py| -> PyResult<_> {
-                            let asyncio = py.import_bound("asyncio")?;
-                            let event_loop = asyncio.getattr("new_event_loop")?.call((), None)?;
-                            // event_loop.call_method("run_forever", (), None)?;
-                            asyncio.call_method1("set_event_loop", (&event_loop,))?;
-                            do_in!(|| info!("Event loop: {:#?}", event_loop.__str__()?));
-
-                            // event_loop.call_method0("run_forever")?;
-
-                            // do_in!(|py| event_loop.call_method0(py, "run_forever"))?;
-                            // do_in!(|| info!("Event loop: {:#?}", event_loop.__str__()?));
-
-                            // do_in!(|py| event_loop.call_method_bound(py, "run_forever", (), None))?;
-                            // info!("Started event loop");
-
-                            let module_name = "jupyter_client";
-
-                            // let ksm = PyPath::new(module_name, vec!["kernelspec", "KernelSpecManager"])
-                            //     .into_py()?;
-                            // do_in!(|| info!("Initialized `KernelSpecManager` {:#?}", ksm.__str__()?));
-
-                            let km = Python::with_gil(|py| {
-                                PyPath::new(module_name, vec!["manager", "AsyncKernelManager"])
-                                    .into_py()
-                                    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?
-                                    .call_bound(py, (), None)
-                            })?;
-                            do_in!(|| info!(
-                                "Initialized `AsyncKernelManager` {:#?}",
-                                km.__str__()?
-                            ));
-
-                            let kernel_id = PyString::new_bound(py, "python3");
-                            let kwargs = kwargs!(py, { "kernel_id" => kernel_id })?;
-                            let coro =
-                                km.call_method_bound(py, "start_kernel", (), Some(&kwargs))?;
-                            info!("Got coro");
-
-                            let rx = Awaitable::schedule(coro, &event_loop)?;
-
-                            Ok(rx)
-                        })
-                        .map_err(forward_err_with(|err: PyErr| err.to_string()))?;
-
-                        let res = rx.await?;
-                        do_in!(|| info!("Result: {}", res.__str__()?));
-
-                        // let kc = Python::with_gil(|py| -> PyResult<_> {
-                        //     // TODO: Enable discovery and selection of kernels
-                        //     let kernel_id = PyString::new_bound(py, "python3");
-                        //     let kwargs = kwargs!(py, { "kernel_id" => kernel_id })?;
-
-                        //     km.call_method_bound(py, "client", (), Some(&kwargs))
-                        // })?;
-
-                        // match tx.send(event_loop) {
-                        //     Ok(_) => {}
-                        //     Err(err) => {
-                        //         error!("{err}");
-                        //         break Ok(());
-                        //     }
-                        // };
-                    }
+                    KernelCommand::Start { tx } => {}
                     _ => {}
                 }
             };

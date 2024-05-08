@@ -286,7 +286,7 @@ impl project::Item for Notebook {
             let mut notebook = builder.build().await;
 
             pyo3::prepare_freethreaded_python();
-            if let Err(err) = Python::with_gil(|py| -> PyResult<_> {
+            if let Err(err) = do_in!(|py| -> PyResult<_> {
                 let sys = py.import_bound("sys")?;
                 let version = sys.getattr("version")?;
                 do_in!(|| info!("Found Python version: {}", version.__str__()?));
@@ -300,6 +300,11 @@ impl project::Item for Notebook {
                 do_in!(|| info!(
                     "Python executable: {}",
                     sys.getattr("executable").ok()?.__str__()?
+                ));
+
+                do_in!(|| info!(
+                    "Python sys.argv: {:#?}",
+                    sys.getattr("argv").ok()?.__str__()?
                 ));
 
                 let pythonpath = sys.getattr("path")?.extract::<Vec<String>>()?;
