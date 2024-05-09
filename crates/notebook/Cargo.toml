@@ -26,7 +26,7 @@ languages.workspace = true
 log.workspace = true
 multi_buffer.workspace = true
 project.workspace = true
-pyo3 = { version = "0.21.2" }
+pyo3 = { version = "0.21.2", features = ["experimental-async"] }
 regex.workspace = true
 rope.workspace = true
 rpc.workspace = true

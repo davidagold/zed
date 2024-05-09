@@ -44,7 +44,7 @@ impl Notebook {
     }
 
     async fn try_set_kernel_client(&mut self, cx: &AsyncAppContext) -> anyhow::Result<()> {
-        let kc = JupyterKernelClient::new(cx).await?;
+        let kc = JupyterKernelClient::new(cx.clone()).await?;
         self.kernel_client.replace(Arc::new(kc));
         Ok(())
     }
@@ -225,10 +225,8 @@ impl project::Item for Notebook {
         // TODO: If the workspace has an active `NotebookEditor` view for the requested `path`,
         //       we should activate the existing view.
         if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
-            info!("Failed to detect extension for path `{:#?}`", path);
             return None;
         }
-        info!("Detected `.ipynb` extension for path `{:#?}`", path);
 
         let project = project_handle.downgrade();
         let cloned_path = path.clone();
@@ -289,23 +287,30 @@ impl project::Item for Notebook {
             if let Err(err) = do_in!(|py| -> PyResult<_> {
                 let sys = py.import_bound("sys")?;
                 let version = sys.getattr("version")?;
-                do_in!(|| info!("Found Python version: {}", version.__str__()?));
 
-                // let insert = sys.getattr("path")?.getattr("insert")?;
-                // let additional_paths = [&(pwd.to_str().unwrap().to_string())];
-                // for path in self.pythonpath.iter().chain(additional_paths) {
-                //     insert.call((0, path), None)?;
-                // }
+                let path = "/Users/davidgold/Projects/zed/crates/notebook";
+                let insert = sys.getattr("path")?;
+                sys.getattr("path")?.call_method1("insert", (0, path))?;
+                do_in!(|| {
+                    info!("Found Python version: {}", version.__str__()?);
+                    let exec = sys.getattr("executable").ok()?;
+                    info!("Python executable: {}", exec.__str__()?);
+                });
 
-                do_in!(|| info!(
-                    "Python executable: {}",
-                    sys.getattr("executable").ok()?.__str__()?
-                ));
-
-                do_in!(|| info!(
-                    "Python sys.argv: {:#?}",
-                    sys.getattr("argv").ok()?.__str__()?
-                ));
+                let module = py.import_bound("test_server")?;
+                do_in!(|| info!("module: {:#?}", module.__str__()?));
+                let conn = match module.getattr("KernelConnection") {
+                    Ok(conn) => {
+                        info!("`KernelConnection`: {:#?}", conn);
+                        conn
+                    }
+                    Err(err) => {
+                        error!("{:#?}", err);
+                        do_in!(|py| err.print(py));
+                        return Err(err);
+                    }
+                };
+                do_in!(|| info!("`KernelConnection`: {:#?}", conn.__str__()?));
 
                 let pythonpath = sys.getattr("path")?.extract::<Vec<String>>()?;
                 let str_python_path = serde_json::to_string_pretty(&pythonpath)
