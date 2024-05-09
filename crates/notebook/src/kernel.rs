@@ -1,14 +1,10 @@
-use std::borrow::{Borrow, BorrowMut};
-use std::cell::Cell;
 use std::sync::OnceLock;
-use std::task::{Context, Poll};
 
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use futures::Future;
 use gpui::{AsyncAppContext, Task};
 use log::{error, info};
-use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{
@@ -19,7 +15,6 @@ use pyo3::{
 use runtimelib::media::MimeType;
 use serde::Deserialize;
 use serde_json::Value;
-use std::pin::{pin, Pin};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::common::forward_err_with;
@@ -157,9 +152,6 @@ impl Coroutine {
 
         cx.spawn(|cx| async {
             do_in!(|py| -> PyResult<_> {
-                // let asyncio = py.import_bound("asyncio")?;
-                // let (tx, rx) = oneshot::channel::<PyResult<Py<PyAny>>>();
-
                 do_in!(|| info!("`coro`: {:#?}", coro.__str__()?));
                 let coro = Coroutine { coro }.into_py(py);
 
@@ -175,26 +167,6 @@ impl Coroutine {
                     .map(|obj| obj.unbind())
             })
         })
-    }
-
-    // fn spawn(coro: Py<PyAny>, cx: &AsyncAppContext) -> PyResult<()> {
-    //     cx.spawn(|cx| async {
-    //         let Ok(task_rx) = Coroutine::schedule(coro) else {
-    //             return;
-    //         };
-    //         let _ = task_rx.await;
-    //     })
-    //     .detach();
-    //     Ok(())
-    // }
-
-    fn run_sync(coro: Py<PyAny>, py: Python) -> PyResult<Py<PyAny>> {
-        let utils = py.import_bound("jupyter_core")?.getattr("utils")?;
-        utils
-            .getattr("run_sync")?
-            .call1((coro,))?
-            .call0()
-            .map(|obj| obj.unbind())
     }
 }
 
