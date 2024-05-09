@@ -89,6 +89,17 @@ fn ensure_future<'py>(
 #[pyclass]
 struct Callback {
     tx: OnceLock<oneshot::Sender<PyResult<Py<PyAny>>>>,
+    rx: OnceLock<oneshot::Receiver<PyResult<Py<PyAny>>>>,
+}
+
+impl Callback {
+    fn new() -> Callback {
+        let (tx, rx) = oneshot::channel::<PyResult<Py<PyAny>>>();
+        Callback {
+            tx: OnceLock::from(tx),
+            rx: OnceLock::from(rx),
+        }
+    }
 }
 
 #[pymethods]
@@ -108,52 +119,54 @@ impl Callback {
 #[pyclass]
 struct Coroutine {
     coro: Py<PyAny>,
+    callback: Option<Callback>,
 }
 
 #[pymethods]
 impl Coroutine {
     #[pyo3(signature = (*args, **kwargs))]
-    async fn __call__(&self, args: Py<PyTuple>, kwargs: Option<Py<PyDict>>) -> PyResult<()> {
-        let rx = do_in!(|py| {
-            info!("[Coroutine::__call__] Called");
+    async fn __call__(&mut self, args: Py<PyTuple>, kwargs: Option<Py<PyDict>>) -> PyResult<()> {
+        if let Some(rx) = do_in!(|py| {
             let event_loop = get_running_loop(py)?;
             let fut = ensure_future(py, &self.coro, Some(&event_loop))?;
 
-            let (tx, rx) = oneshot::channel::<PyResult<Py<PyAny>>>();
-            let callback = Callback {
-                tx: OnceLock::from(tx),
+            if let Some(mut callback) = self.callback.take() {
+                let rx = callback.rx.take();
+                match fut.call_method1("add_done_callback", (callback.into_py(py),)) {
+                    Ok(res) => info!("[Coroutine::__call__] Added callback to future"),
+                    Err(err) => {
+                        error!("[Coroutine::__call__] Failed to add callback");
+                        err.print_and_set_sys_last_vars(py)
+                    }
+                };
+                PyResult::Ok(rx)
+            } else {
+                PyResult::Ok(None)
             }
-            .into_py(py);
+        })? {
+            let result = rx.await.map_err(|err| {
+                error!("Nope: {:#?}", err);
+                PyRuntimeError::new_err(err.to_string())
+            })??;
+            do_in!(|| info!("{:#?}", result.__str__()?));
+        }
 
-            match do_in!(|| fut.call_method1("add_done_callback", (callback,))) {
-                Some(Ok(res)) => info!("[Coroutine::__call__] Added callback to future"),
-                Some(Err(err)) => {
-                    error!("[Coroutine::__call__] Failed to add callback");
-                    err.print_and_set_sys_last_vars(py)
-                }
-                None => error!("Callback was not set"),
-            };
-
-            PyResult::Ok(rx)
-        })?;
-
-        let result = rx.await.map_err(|err| {
-            error!("Nope: {:#?}", err);
-            PyRuntimeError::new_err(err.to_string())
-        })??;
-        do_in!(|| info!("{:#?}", result.__str__()?));
         Ok(())
     }
 }
 
 impl Coroutine {
-    fn schedule(coro: Py<PyAny>, cx: &AsyncAppContext) -> Task<PyResult<Py<PyAny>>> {
+    fn schedule(
+        coro: Py<PyAny>,
+        callback: Option<Callback>,
+        cx: &AsyncAppContext,
+    ) -> Task<PyResult<Py<PyAny>>> {
         do_in!(|| info!("Scheduling coroutine {:#?}", coro.__str__()?));
 
-        cx.spawn(|cx| async {
+        cx.spawn(|_| async {
             do_in!(|py| -> PyResult<_> {
                 do_in!(|| info!("`coro`: {:#?}", coro.__str__()?));
-                let coro = Coroutine { coro }.into_py(py);
+                let coro = Coroutine { coro, callback }.into_py(py);
 
                 let utils = py.import_bound("jupyter_core")?.getattr("utils")?;
                 let event_loop = utils.getattr("ensure_event_loop")?.call0()?;
@@ -163,7 +176,7 @@ impl Coroutine {
                 ));
 
                 event_loop
-                    .call_method1("run_until_complete", (coro.call0(py)?,))
+                    .call_method1("create_task", (coro.call0(py)?,))
                     .map(|obj| obj.unbind())
             })
         })
@@ -176,6 +189,13 @@ impl JupyterKernelClient {
         let cloned_tx = tx.clone();
         cx.spawn(|cx| async { JupyterKernelClient::task(rx, cloned_tx, cx).await })
             .detach();
+
+        let (ping_cmd, rx) = KernelCommand::ping();
+        tx.send(ping_cmd).await?;
+        rx.await?;
+
+        let run_cmd = KernelCommand::run("print('Hello World')".into());
+        tx.send(run_cmd).await?;
 
         Ok(JupyterKernelClient { command_tx: tx })
     }
@@ -195,7 +215,7 @@ impl JupyterKernelClient {
 
         let task = match do_in!(|py| -> PyResult<Task<_>> {
             let coro = conn.call_method0(py, "start_kernel")?;
-            Ok(Coroutine::schedule(coro, &cx))
+            Ok(Coroutine::schedule(coro, Some(Callback::new()), &cx))
         }) {
             Ok(task) => {
                 info!("Got task receiver");
@@ -213,6 +233,17 @@ impl JupyterKernelClient {
 
         let _ = task.await;
 
+        match do_in!(|py| -> PyResult<Task<_>> {
+            let coro = conn.call_method0(py, "listen")?;
+            Ok(Coroutine::schedule(coro, Some(Callback::new()), &cx))
+        }) {
+            Ok(task) => task.detach(),
+            Err(err) => {
+                do_in!(|py| err.print(py));
+                return Err(anyhow!(err));
+            }
+        };
+
         info!("[JupyterKernelClient task] Starting inner loop");
         loop {
             info!("Waiting for commands...");
@@ -225,11 +256,14 @@ impl JupyterKernelClient {
                     }
                     Run { code } => {
                         info!("Received code: {}", code);
-                        // let msg_id = do_in!(|py| async_kc.call_method1(py, "execute", (code,)))?;
-                        // do_in!(|| info!(
-                        //     "Submitted execution request with message id: {}",
-                        //     msg_id.__str__()?
-                        // ));
+                        do_in!(|py| {
+                            match conn.call_method1(py, "execute_code", (code,)) {
+                                Ok(response) => {
+                                    do_in!(|| info!("Message ID: {:#?}", response.__str__()?));
+                                }
+                                Err(err) => err.print(py),
+                            }
+                        });
                     }
                     Log { text } => {
                         info!("Log message: {}", text);
@@ -261,6 +295,17 @@ enum KernelCommand {
     Ping { tx: oneshot::Sender<()> },
     // Log { rx: oneshot::Sender<String> },
     Log { text: String },
+}
+
+impl KernelCommand {
+    fn ping() -> (KernelCommand, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (KernelCommand::Ping { tx }, rx)
+    }
+
+    fn run(code: String) -> KernelCommand {
+        KernelCommand::Run { code }
+    }
 }
 
 struct JupyterMessageHeader {

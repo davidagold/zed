@@ -160,6 +160,13 @@ class KernelConnection:
         self._ksm = KernelSpecManager()
         self._km = AsyncKernelManager()
 
+        def stream_handler(msg: Message):
+            if msg.content.name == "stdout":
+                raise ValueError("Got the message")
+                print(msg.content.text)
+
+        self.set_message_handler(IoPubSubChannelMessage.Stream, stream_handler)
+
     @property
     def client(self) -> AsyncKernelClient:
         return self._km.client(kernel_id=self.kernel_id)
@@ -190,6 +197,7 @@ class KernelConnection:
         sys.exit(0)
 
     async def listen(self):
+        "Starting listener task"
         while True:
             msg = Message.validate(await self.client.get_iopub_msg())
             # rich.print(msg)
