@@ -175,7 +175,10 @@ impl Coroutine {
                 error!("Error: {:#?}", err);
                 Err(err)
             }
-            Ok(None) => PyResult::Ok(do_in!(|py| py.None())),
+            Ok(None) => {
+                error!("We shouldn't be here");
+                PyResult::Ok(do_in!(|py| py.None()))
+            }
         }
     }
 }
@@ -189,7 +192,7 @@ impl Coroutine {
         do_in!(|| info!("Scheduling coroutine {:#?}", coro.__str__()?));
 
         cx.spawn(|_| async {
-            do_in!(|py| -> PyResult<_> {
+            match do_in!(|py| -> PyResult<_> {
                 do_in!(|| info!("`coro`: {:#?}", coro.__str__()?));
                 let coro = Coroutine { coro, callback }.into_py(py);
 
@@ -200,17 +203,16 @@ impl Coroutine {
                     event_loop.__str__()?
                 ));
 
-                match event_loop
+                event_loop
                     .call_method1("create_task", (coro.call0(py)?,))
                     .map(|obj| obj.unbind())
-                {
-                    Ok(result) => Ok(result),
-                    Err(err) => {
-                        do_in!(|py| err.print(py));
-                        Err(err)
-                    }
+            }) {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    do_in!(|py| err.print(py));
+                    Err(err)
                 }
-            })
+            }
         })
     }
 }
