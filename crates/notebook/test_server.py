@@ -3,7 +3,7 @@ import asyncio
 from asyncio.taskgroups import TaskGroup
 from asyncio.tasks import sleep
 from enum import Enum
-from functools import lru_cache, partial
+from functools import cached_property, lru_cache, partial
 import logging
 import signal
 from subprocess import CompletedProcess
@@ -67,7 +67,6 @@ class MessageType:
     @classmethod
     def from_string(cls: Type["MessageType"], val: str) -> "MessageType":
         if cls == MessageType:
-            print(list(cls.__subclasses__()))
             return one(
                 variant
                 for sub_cls in cls.__subclasses__()
@@ -156,18 +155,11 @@ MessageHandler = Callable[[Message], None]
 class KernelConnection:
     def __init__(self, kernel_id: str):
         self.kernel_id = kernel_id
-        self._handlers: Dict[MessageType, MessageHandler] = {}
+        self._handlers: Dict[Type[MessageType], MessageHandler] = {}
         self._ksm = KernelSpecManager()
         self._km = AsyncKernelManager()
 
-        def stream_handler(msg: Message):
-            if msg.content.name == "stdout":
-                raise ValueError("Got the message")
-                print(msg.content.text)
-
-        self.set_message_handler(IoPubSubChannelMessage.Stream, stream_handler)
-
-    @property
+    @cached_property
     def client(self) -> AsyncKernelClient:
         return self._km.client(kernel_id=self.kernel_id)
 
@@ -197,16 +189,16 @@ class KernelConnection:
         sys.exit(0)
 
     async def listen(self):
-        "Starting listener task"
+        print("Starting listener task")
         while True:
             msg = Message.validate(await self.client.get_iopub_msg())
             # rich.print(msg)
             print(msg)
-            if (handler := self._handlers.get(msg.msg_type, None)) is not None:
+            if (handler := self._handlers.get(type(msg.msg_type), None)) is not None:
                 handler(msg)
 
 
-    def set_message_handler(self, msg_type: MessageType, handler: MessageHandler, evict: bool = False):
+    def set_message_handler(self, msg_type: Type[MessageType], handler: MessageHandler, evict: bool = False):
         if msg_type in self._handlers and not evict:
             raise ValueError("Cannot reset handler without specifying `evict=True`")
 

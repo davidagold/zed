@@ -1,7 +1,9 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use collections::HashMap;
+use futures::{select, FutureExt};
 use gpui::{AsyncAppContext, Task};
 use log::{error, info};
 use pyo3::exceptions::PyRuntimeError;
@@ -125,10 +127,15 @@ struct Coroutine {
 #[pymethods]
 impl Coroutine {
     #[pyo3(signature = (*args, **kwargs))]
-    async fn __call__(&mut self, args: Py<PyTuple>, kwargs: Option<Py<PyDict>>) -> PyResult<()> {
-        if let Some(rx) = do_in!(|py| {
+    async fn __call__(
+        &mut self,
+        args: Py<PyTuple>,
+        kwargs: Option<Py<PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        match do_in!(|py| -> PyResult<_> {
             let event_loop = get_running_loop(py)?;
             let fut = ensure_future(py, &self.coro, Some(&event_loop))?;
+            do_in!(|| info!("Ensured future: {}", fut.__str__()?));
 
             if let Some(mut callback) = self.callback.take() {
                 let rx = callback.rx.take();
@@ -141,17 +148,35 @@ impl Coroutine {
                 };
                 PyResult::Ok(rx)
             } else {
-                PyResult::Ok(None)
+                Err(PyRuntimeError::new_err("Nope"))
             }
-        })? {
-            let result = rx.await.map_err(|err| {
-                error!("Nope: {:#?}", err);
-                PyRuntimeError::new_err(err.to_string())
-            })??;
-            do_in!(|| info!("{:#?}", result.__str__()?));
+        }) {
+            Ok(Some(rx)) => {
+                info!("Awaiting result");
+                match rx.await {
+                    Ok(Ok(result)) => {
+                        do_in!(|| info!("Got result: {:#?}", result.__str__()?));
+                        Ok(result)
+                    }
+                    Ok(Err(err)) => {
+                        do_in!(|py| {
+                            error!("Error awaiting result: {:#?}", err);
+                            err.print(py)
+                        });
+                        Err(err)
+                    }
+                    Err(err) => Err(PyRuntimeError::new_err(format!(
+                        "Error receiving result: {:#?}",
+                        err
+                    ))),
+                }
+            }
+            Err(err) => {
+                error!("Error: {:#?}", err);
+                Err(err)
+            }
+            Ok(None) => PyResult::Ok(do_in!(|py| py.None())),
         }
-
-        Ok(())
     }
 }
 
@@ -175,10 +200,41 @@ impl Coroutine {
                     event_loop.__str__()?
                 ));
 
-                event_loop
+                match event_loop
                     .call_method1("create_task", (coro.call0(py)?,))
                     .map(|obj| obj.unbind())
+                {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        do_in!(|py| err.print(py));
+                        Err(err)
+                    }
+                }
             })
+        })
+    }
+}
+
+#[pyclass]
+struct IoPubsubMessageHandler {
+    tx: mpsc::Sender<String>,
+}
+
+impl IoPubsubMessageHandler {
+    fn new() -> (IoPubsubMessageHandler, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(1024);
+        (IoPubsubMessageHandler { tx }, rx)
+    }
+}
+
+#[pymethods]
+impl IoPubsubMessageHandler {
+    #[pyo3(signature = (msg))]
+    fn __call__<'py>(&self, py: Python<'py>, msg: &Bound<'py, PyAny>) -> PyResult<()> {
+        do_in!(|| info!("Handler called with message: {}", msg.__str__()?));
+        let serialized = py.import_bound("json")?.getattr("dumps")?.call1((msg,))?;
+        self.tx.try_send(serialized.extract()?).map_err(|err| {
+            PyRuntimeError::new_err(format!("Failed to send message: {:#?}", err.to_string()))
         })
     }
 }
@@ -217,10 +273,7 @@ impl JupyterKernelClient {
             let coro = conn.call_method0(py, "start_kernel")?;
             Ok(Coroutine::schedule(coro, Some(Callback::new()), &cx))
         }) {
-            Ok(task) => {
-                info!("Got task receiver");
-                task
-            }
+            Ok(task) => task,
             Err(err) => {
                 error!("Failed to obtain receiver: {:#?}", err);
                 do_in!(|py| err.print(py));
@@ -231,7 +284,11 @@ impl JupyterKernelClient {
             }
         };
 
-        let _ = task.await;
+        if let Err(err) = task.await {
+            do_in!(|py| err.print(py))
+        } else {
+            info!("We did it!")
+        };
 
         match do_in!(|py| -> PyResult<Task<_>> {
             let coro = conn.call_method0(py, "listen")?;
@@ -244,31 +301,58 @@ impl JupyterKernelClient {
             }
         };
 
+        let (io_pubsub_handler, mut conn_rx) = IoPubsubMessageHandler::new();
+        if let Err(err) = do_in!(|py| {
+            let io_pubsub_msg_type = py
+                .import_bound("test_server")?
+                .getattr("IoPubSubChannelMessage")?;
+            let args = (io_pubsub_msg_type, io_pubsub_handler);
+            conn.call_method1(py, "set_message_handler", args)
+        }) {
+            error!("Failed to add message handler for IO PubSub channel");
+            do_in!(|py| err.print(py));
+        }
+
+        // do_in!(|py| {
+        //     Some(info!(
+        //         "Handlers: {:#?}",
+        //         conn.getattr(py, "_handlers").ok()?.__str__()?
+        //     ))
+        // });
+
         info!("[JupyterKernelClient task] Starting inner loop");
         loop {
-            info!("Waiting for commands...");
-            if let Some(cmd) = rx.recv().await {
-                use KernelCommand::*;
-                match cmd {
-                    Ping { tx } => {
-                        do_in!(|| tx.send(()).ok()?);
-                        info!("Pong");
-                    }
-                    Run { code } => {
-                        info!("Received code: {}", code);
-                        do_in!(|py| {
-                            match conn.call_method1(py, "execute_code", (code,)) {
-                                Ok(response) => {
-                                    do_in!(|| info!("Message ID: {:#?}", response.__str__()?));
+            cx.background_executor()
+                .timer(Duration::from_millis(5))
+                .await;
+            select! {
+                msg = conn_rx.recv().fuse() => {
+                    info!("Hello!");
+                    do_in!(|| info!("Received message {}", msg?));
+                }
+                cmd = rx.recv().fuse() => {
+                    use KernelCommand::*;
+                    match cmd {
+                        Some(Ping { tx }) => {
+                            do_in!(|| tx.send(()).ok()?);
+                            info!("Pong");
+                        }
+                        Some(Run { code }) => {
+                            info!("Received code: {}", code);
+                            do_in!(|py| {
+                                match conn.call_method1(py, "execute_code", (code,)) {
+                                    Ok(response) => {
+                                        do_in!(|| info!("Message ID: {:#?}", response.__str__()?));
+                                    }
+                                    Err(err) => err.print(py),
                                 }
-                                Err(err) => err.print(py),
-                            }
-                        });
+                            });
+                        }
+                        Some(Log { text }) => {
+                            info!("Log message: {}", text);
+                        }
+                        _ => {}
                     }
-                    Log { text } => {
-                        info!("Log message: {}", text);
-                    }
-                    _ => {}
                 }
             };
         }
