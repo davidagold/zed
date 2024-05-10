@@ -217,7 +217,7 @@ impl JupyterKernelClient {
         cx: AsyncAppContext,
     ) -> anyhow::Result<()> {
         let conn = do_in!(|py| -> PyResult<_> {
-            py.import_bound("test_server")?
+            py.import_bound("connection")?
                 .getattr("KernelConnection")?
                 .call((), Some(&kwargs!(py, { "kernel_id" => "python3" })?))
                 .map(|obj| obj.unbind())
@@ -255,7 +255,7 @@ impl JupyterKernelClient {
         let (io_pubsub_handler, mut conn_rx) = MessageHandler::new();
         if let Err(err) = do_in!(|py| {
             let io_pubsub_msg_type = py
-                .import_bound("test_server")?
+                .import_bound("connection")?
                 .getattr("IoPubSubChannelMessage")?;
             let args = (io_pubsub_msg_type, io_pubsub_handler);
             conn.call_method1(py, "set_message_handler", args)

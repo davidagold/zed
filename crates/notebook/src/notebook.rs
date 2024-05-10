@@ -289,7 +289,7 @@ impl project::Item for Notebook {
                 let sys = py.import_bound("sys")?;
                 let version = sys.getattr("version")?;
 
-                let path = "/Users/davidgold/Projects/zed/crates/notebook";
+                let path = "/Users/davidgold/Projects/zed/crates/notebook/src/jupyter";
                 sys.getattr("path")?.call_method1("insert", (0, path))?;
                 do_in!(|| {
                     info!("Found Python version: {}", version.__str__()?);
