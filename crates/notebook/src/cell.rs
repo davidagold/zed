@@ -1,25 +1,24 @@
-// use crate::common::python_lang;
 use crate::do_in;
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::{ExcerptId, ExcerptRange};
+use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::Itertools;
-use language::{Buffer, File};
+use language::{Buffer, Capability, File};
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
 use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
-use sum_tree::{SumTree, Summary};
+use sum_tree::{Cursor, Dimension, SumTree, Summary};
 use ui::Context;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub id: CellId,
-    // `cell_id` is a notebook field
-    pub cell_id: Option<String>,
+    pub cell_id: Option<String>, // `cell_id` is a notebook field
+    _excerpt_id: std::cell::Cell<ExcerptId>,
     pub cell_type: CellType,
     pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
@@ -31,6 +30,7 @@ pub struct Cell {
 #[derive(Default)]
 pub struct CellBuilder {
     id: u64,
+    excerpt_id: std::cell::Cell<ExcerptId>,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
     metadata: Option<HashMap<String, serde_json::Value>>,
@@ -164,6 +164,7 @@ impl CellBuilder {
     pub fn build(self) -> Cell {
         Cell {
             id: CellId(self.id),
+            _excerpt_id: std::cell::Cell::new(self.excerpt_id.take()),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
             metadata: self.metadata.unwrap(),
@@ -220,24 +221,79 @@ impl<'de> serde::Deserialize<'de> for CellType {
     }
 }
 
-#[derive(Default)]
-pub struct Cells(SumTree<Cell>);
+pub struct Cells {
+    pub(crate) tree: SumTree<Cell>,
+    pub(crate) multi: Model<MultiBuffer>,
+}
 
 impl Cells {
+    pub(crate) fn empty(cx: &mut AsyncAppContext) {
+        let mut celltree = SumTree::<Cell>::new();
+    }
+
     pub fn push_cell(&mut self, cell: Cell, cx: &<CellSummary as Summary>::Context) {
-        self.0.push(cell, cx);
+        self.tree.push(cell, cx);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Cell> {
-        self.0.iter()
+        self.tree.iter()
     }
-}
 
-impl Clone for Cells {
-    fn clone(&self) -> Self {
-        self.iter().fold(Cells::default(), |mut cells, cell| {
-            cells.push_cell(cell.clone(), &());
-            cells
+    pub fn summary(&self) -> &CellSummary {
+        self.tree.summary()
+    }
+
+    pub fn cursor<'a, D>(&'a self) -> Cursor<'a, Cell, D>
+    where
+        D: Dimension<'a, CellSummary>,
+    {
+        self.tree.cursor::<D>()
+    }
+
+    pub fn from_builders<'c>(
+        mut builders: Vec<CellBuilder>,
+        cx: &mut AsyncAppContext,
+    ) -> Result<Cells> {
+        let multi = cx.new_model(|model_cx| {
+            let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
+
+            // TODO: Actually guarantee some invariance in `CellId` -> `ExcerptId`.
+            let mut prev_excerpt_id = ExcerptId::min();
+            for builder in builders.iter_mut() {
+                let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
+                // let cell = builder.build(prev_excerpt_id.clone());
+                builder.excerpt_id.set(excerpt_id);
+                do_in!(|| {
+                    let source = builder.source.as_ref()?.clone();
+                    let range = excerpt_range_over_buffer(&source, model_cx);
+                    multi.insert_excerpts_with_ids_after(
+                        prev_excerpt_id,
+                        source,
+                        vec![(excerpt_id, range)],
+                        model_cx,
+                    );
+                    prev_excerpt_id = excerpt_id;
+                });
+
+                if let Some(output_buffer) = &builder.output_content {
+                    let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
+                    let range = excerpt_range_over_buffer(&output_buffer, model_cx);
+                    multi.insert_excerpts_with_ids_after(
+                        prev_excerpt_id,
+                        output_buffer.clone(),
+                        vec![(excerpt_id, range)],
+                        model_cx,
+                    );
+                    prev_excerpt_id = excerpt_id;
+                }
+            }
+
+            multi
+        })?;
+
+        Ok(Cells {
+            tree: SumTree::<Cell>::from_iter(builders.into_iter().map(|b| b.build()), &()),
+            multi,
         })
     }
 }
@@ -247,14 +303,61 @@ impl sum_tree::Item for Cell {
 
     fn summary(&self) -> Self::Summary {
         CellSummary {
-            cell_type: self.cell_type.clone(),
-            // text_summary: source.base_text().summary(),
+            trailing_cell_id: self.id,
+            trailing_excerpt_id: self._excerpt_id.get().clone(),
         }
     }
 }
 
+impl<'a> Dimension<'a, CellSummary> for CellId {
+    fn add_summary(&mut self, _summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
+        self.0 = std::cmp::max(self.0, _summary.trailing_cell_id.0);
+    }
+    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
+        summary.trailing_cell_id
+    }
+}
+
+impl<'a> Dimension<'a, CellSummary> for ExcerptId {
+    fn add_summary(&mut self, _summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
+        *self = std::cmp::max(*self, _summary.trailing_excerpt_id)
+    }
+    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
+        summary.trailing_excerpt_id
+    }
+}
+
+impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for ExcerptId {
+    fn cmp(
+        &self,
+        cursor_location: &CellSummary,
+        cx: &<CellSummary as Summary>::Context,
+    ) -> std::cmp::Ordering {
+        Ord::cmp(self, &cursor_location.trailing_excerpt_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CellSummary {
+    trailing_cell_id: CellId,
+    trailing_excerpt_id: ExcerptId,
+}
+
+impl Summary for CellSummary {
+    type Context = ();
+
+    fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {
+        self.trailing_cell_id.0 =
+            std::cmp::max(self.trailing_cell_id.0, summary.trailing_cell_id.0);
+        self.trailing_excerpt_id = ExcerptId::from_proto(std::cmp::max(
+            self.trailing_excerpt_id.to_proto(),
+            summary.trailing_excerpt_id.to_proto(),
+        ));
+    }
+}
+
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Ord, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, PartialOrd, Ord, Eq)]
 pub struct CellId(u64);
 
 impl From<u64> for CellId {
@@ -279,18 +382,6 @@ impl Into<ExcerptId> for CellId {
     fn into(self) -> ExcerptId {
         ExcerptId::from_proto(self.into())
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CellSummary {
-    cell_type: CellType,
-    // text_summary: TextSummary,
-}
-
-impl Summary for CellSummary {
-    type Context = ();
-
-    fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {}
 }
 
 #[derive(Clone, Debug, Deserialize)]

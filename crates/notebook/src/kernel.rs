@@ -6,13 +6,16 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PyString, PyTuple};
 use pyo3::{pyclass, Bound, Py, PyAny, PyResult, Python};
+use ui::ViewContext;
 
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cell::{Cell, CellId};
 use crate::common::{forward_err_with, forward_with_print};
 use crate::do_in;
+use crate::editor::NotebookEditor;
 use crate::jupyter::message::{IoPubSubMessageType, Message, MessageType};
 use crate::jupyter::python::{Pydantic, TryAsStr};
 use crate::kwargs;
@@ -78,7 +81,6 @@ struct Coroutine {
 
 #[pymethods]
 impl Coroutine {
-    // #[pyo3(signature = (*args, **kwargs))]
     #[pyo3(signature = ())]
     async fn __call__(&mut self) -> PyResult<Py<PyAny>> {
         match do_in!(|py| -> PyResult<_> {
@@ -197,23 +199,29 @@ impl MessageHandler {
 impl JupyterKernelClient {
     pub async fn new(cx: AsyncAppContext) -> Result<JupyterKernelClient> {
         let (tx, rx) = mpsc::channel::<KernelCommand>(1024);
-        let cloned_tx = tx.clone();
-        cx.spawn(|cx| async { JupyterKernelClient::task(rx, cloned_tx, cx).await })
+        cx.spawn(|cx| async { JupyterKernelClient::task(rx, cx).await })
             .detach();
 
-        let (ping_cmd, rx) = KernelCommand::ping();
-        tx.send(ping_cmd).await?;
-        rx.await?;
+        let client = JupyterKernelClient { command_tx: tx };
+        client.ping_task().await?;
+        Ok(client)
+    }
 
-        let run_cmd = KernelCommand::run("print('Hello World')".into());
-        tx.send(run_cmd).await?;
+    pub(crate) fn run_cell(
+        &self,
+        cell: &Cell,
+        cx: &mut ViewContext<NotebookEditor>,
+    ) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {
+        let code = cell.source.read(cx).text_snapshot().text();
+        self.send(KernelCommand::run(cell.id, code))
+    }
 
-        Ok(JupyterKernelClient { command_tx: tx })
+    fn send(&self, cmd: KernelCommand) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {
+        self.command_tx.try_send(cmd)
     }
 
     async fn task(
         mut rx: mpsc::Receiver<KernelCommand>,
-        command_tx: mpsc::Sender<KernelCommand>,
         cx: AsyncAppContext,
     ) -> anyhow::Result<()> {
         let conn = do_in!(|py| -> PyResult<_> {
@@ -293,7 +301,7 @@ impl JupyterKernelClient {
                         Some(Ping { tx }) => {
                             do_in!(|| tx.send(()).ok()?);
                         }
-                        Some(Run { code }) => {
+                        Some(Run { cell_id, code }) => {
                             do_in!(|py| {
                                 match conn.call_method1(py, "execute_code", (code,)) {
                                     Ok(response) => {
@@ -312,6 +320,12 @@ impl JupyterKernelClient {
             };
         }
     }
+
+    async fn ping_task(&self) -> Result<()> {
+        let (ping_cmd, rx) = KernelCommand::ping();
+        self.command_tx.send(ping_cmd).await?;
+        rx.await.map_err(|err| anyhow!(err))
+    }
 }
 
 // TODO: Decide whether to include these or save them for later
@@ -326,22 +340,22 @@ enum KernelState {
 }
 
 #[derive(Debug)]
-enum KernelCommand {
+pub(crate) enum KernelCommand {
     Start { tx: oneshot::Sender<Py<PyAny>> },
     Stop {},
     Interrupt {},
-    Run { code: String },
+    Run { cell_id: CellId, code: String },
     Ping { tx: oneshot::Sender<()> },
     Log { text: String },
 }
 
 impl KernelCommand {
-    fn ping() -> (KernelCommand, oneshot::Receiver<()>) {
+    pub(crate) fn ping() -> (KernelCommand, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         (KernelCommand::Ping { tx }, rx)
     }
 
-    fn run(code: String) -> KernelCommand {
-        KernelCommand::Run { code }
+    pub(crate) fn run(cell_id: CellId, code: String) -> KernelCommand {
+        KernelCommand::Run { cell_id, code }
     }
 }

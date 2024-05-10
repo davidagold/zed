@@ -8,8 +8,8 @@ mod kernel;
 use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
 use crate::jupyter::python::TryAsStr;
-use anyhow::anyhow;
-use cell::CellBuilder;
+use anyhow::{anyhow, Result};
+use cell::{Cell, CellBuilder};
 use collections::HashMap;
 use gpui::{AsyncAppContext, Context, WeakModel};
 use kernel::JupyterKernelClient;
@@ -19,13 +19,14 @@ use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
 use serde::de::{self, DeserializeSeed, Error, Visitor};
 use serde_json::Value;
+use std::default;
 use std::{io::Read, num::NonZeroU64, sync::Arc};
+use sum_tree::SumTree;
 
 use project::{self, Project, ProjectPath};
 use worktree::File;
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#top-level-structure
-#[derive(Default)]
 pub struct Notebook {
     file: Option<Arc<dyn language::File>>,
     language: Option<Arc<Language>>,
@@ -110,7 +111,7 @@ struct NotebookBuilder<'cx> {
     // TODO: Alias `nbformat` and `nbformat_minor` to include `_version` suffix for clarity
     nbformat: Option<usize>,
     nbformat_minor: Option<usize>,
-    cells: Cells,
+    cell_builders: Vec<CellBuilder>,
 }
 
 impl<'cx> NotebookBuilder<'cx> {
@@ -126,18 +127,18 @@ impl<'cx> NotebookBuilder<'cx> {
             metadata: None,
             nbformat: None,
             nbformat_minor: None,
-            cells: Cells::default(),
+            cell_builders: Vec::<CellBuilder>::default(),
         }
     }
 
-    async fn build(mut self) -> Notebook {
+    async fn build(mut self) -> Result<Notebook> {
         let mut notebook = Notebook {
             file: self.file,
             language: None,
             metadata: self.metadata,
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
-            cells: self.cells,
+            cells: Cells::from_builders(self.cell_builders, self.cx)?,
             kernel_client: None,
         };
 
@@ -145,7 +146,7 @@ impl<'cx> NotebookBuilder<'cx> {
             .try_set_source_languages(&self.project_handle, &mut self.cx)
             .await;
 
-        notebook
+        Ok(notebook)
     }
 }
 
@@ -174,16 +175,14 @@ impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
                         let items: Vec<serde_json::Map<String, serde_json::Value>> =
                             parse_value(val)?;
 
-                        for (idx, item) in items.into_iter().enumerate() {
-                            let id = NonZeroU64::new(idx as u64 + 1)
-                                .ok_or_else(|| A::Error::custom("Nope"))?
-                                .into();
+                        for (id, item) in items.into_iter().enumerate() {
+                            let cell_builder = CellBuilder::new((id + 1) as _).process_map(
+                                item,
+                                &self.project_handle,
+                                &mut self.cx,
+                            );
 
-                            let cell = CellBuilder::new(id)
-                                .process_map(item, &self.project_handle, &mut self.cx)
-                                .build();
-
-                            self.cells.push_cell(cell, &())
+                            self.cell_builders.push(cell_builder)
                         }
                     }
                     _ => {}
@@ -284,7 +283,7 @@ impl project::Item for Notebook {
                     )
                 }))?;
 
-            let mut notebook = builder.build().await;
+            let mut notebook = builder.build().await?;
 
             pyo3::prepare_freethreaded_python();
             if let Err(err) = do_in!(|py| -> PyResult<_> {
