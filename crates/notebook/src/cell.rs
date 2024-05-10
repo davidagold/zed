@@ -15,98 +15,6 @@ use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{SumTree, Summary};
 use ui::Context;
 
-pub fn excerpt_range_over_buffer<M>(
-    buffer: &Model<Buffer>,
-    cx: &ModelContext<M>,
-) -> ExcerptRange<usize> {
-    ExcerptRange {
-        context: std::ops::Range {
-            start: 0 as usize,
-            end: buffer.read(cx).len() as _,
-        },
-        primary: None,
-    }
-}
-
-// A phony file struct we use for excerpt titles.
-pub(crate) struct PhonyFile {
-    worktree_id: usize,
-    title: Arc<std::path::Path>,
-    cell_idx: CellId,
-    cell_id: Option<String>,
-}
-
-impl File for PhonyFile {
-    fn as_local(&self) -> Option<&dyn language::LocalFile> {
-        None
-    }
-
-    fn mtime(&self) -> Option<std::time::SystemTime> {
-        None
-    }
-
-    fn path(&self) -> &Arc<std::path::Path> {
-        &self.title
-    }
-
-    fn full_path(&self, _cx: &AppContext) -> std::path::PathBuf {
-        self.title.to_path_buf()
-    }
-
-    fn file_name<'a>(&'a self, _cx: &'a AppContext) -> &'a std::ffi::OsStr {
-        &self.title.as_os_str()
-    }
-
-    fn worktree_id(&self) -> usize {
-        self.worktree_id
-    }
-
-    fn is_deleted(&self) -> bool {
-        false
-    }
-
-    fn is_created(&self) -> bool {
-        false
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self as &dyn Any
-    }
-
-    fn to_proto(&self) -> rpc::proto::File {
-        unimplemented!()
-    }
-
-    fn is_private(&self) -> bool {
-        false
-    }
-}
-
-pub(crate) fn title_for_cell_excerpt(
-    idx: u64,
-    cell_id: Option<&String>,
-    cell_type: &CellType,
-    for_output: bool,
-) -> PhonyFile {
-    let path_buf: PathBuf = match for_output {
-        false => [format!("Cell {idx}"), format!("({:#?})  ", cell_type)]
-            .iter()
-            .rev()
-            .map(|s| s.as_str())
-            .collect(),
-        true => [format!("[Output — Cell {:#?}]", idx)]
-            .iter()
-            .map(|s| s.as_str())
-            .collect(),
-    };
-    PhonyFile {
-        worktree_id: 0,
-        title: Arc::from(path_buf.as_path()),
-        cell_idx: CellId::from(idx),
-        cell_id: cell_id.map(|id| id.clone()),
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub id: CellId,
@@ -146,12 +54,12 @@ impl CellBuilder {
         }
     }
 
-    pub fn build(
+    pub(crate) fn process_map(
         mut self,
-        project_handle: &mut WeakModel<Project>,
         map: serde_json::Map<String, serde_json::Value>,
+        project_handle: &WeakModel<Project>,
         cx: &mut AsyncAppContext,
-    ) -> Cell {
+    ) -> Self {
         for (key, val) in map {
             // Work in a closure to propagate errors without returning early
             let result_parse_entry = do_in!(|| -> Result<_> {
@@ -250,6 +158,10 @@ impl CellBuilder {
             }
         }
 
+        self
+    }
+
+    pub fn build(self) -> Cell {
         Cell {
             id: CellId(self.id),
             cell_id: self.cell_id,
@@ -529,5 +441,97 @@ impl TryFrom<&IpynbCodeOutput> for OutputHandler {
                 metadata,
             } => Ok(OutputHandler::print(None)),
         }
+    }
+}
+
+// A phony file struct we use for excerpt titles.
+pub(crate) struct PhonyFile {
+    worktree_id: usize,
+    title: Arc<std::path::Path>,
+    cell_idx: CellId,
+    cell_id: Option<String>,
+}
+
+impl File for PhonyFile {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn mtime(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    fn path(&self) -> &Arc<std::path::Path> {
+        &self.title
+    }
+
+    fn full_path(&self, _cx: &AppContext) -> std::path::PathBuf {
+        self.title.to_path_buf()
+    }
+
+    fn file_name<'a>(&'a self, _cx: &'a AppContext) -> &'a std::ffi::OsStr {
+        &self.title.as_os_str()
+    }
+
+    fn worktree_id(&self) -> usize {
+        self.worktree_id
+    }
+
+    fn is_deleted(&self) -> bool {
+        false
+    }
+
+    fn is_created(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self as &dyn Any
+    }
+
+    fn to_proto(&self) -> rpc::proto::File {
+        unimplemented!()
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+}
+
+pub fn excerpt_range_over_buffer<M>(
+    buffer: &Model<Buffer>,
+    cx: &ModelContext<M>,
+) -> ExcerptRange<usize> {
+    ExcerptRange {
+        context: std::ops::Range {
+            start: 0 as usize,
+            end: buffer.read(cx).len() as _,
+        },
+        primary: None,
+    }
+}
+
+pub(crate) fn title_for_cell_excerpt(
+    idx: u64,
+    cell_id: Option<&String>,
+    cell_type: &CellType,
+    for_output: bool,
+) -> PhonyFile {
+    let path_buf: PathBuf = match for_output {
+        false => [format!("Cell {idx}"), format!("({:#?})  ", cell_type)]
+            .iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect(),
+        true => [format!("[Output — Cell {:#?}]", idx)]
+            .iter()
+            .map(|s| s.as_str())
+            .collect(),
+    };
+    PhonyFile {
+        worktree_id: 0,
+        title: Arc::from(path_buf.as_path()),
+        cell_idx: CellId::from(idx),
+        cell_id: cell_id.map(|id| id.clone()),
     }
 }

@@ -179,8 +179,10 @@ impl<'cx, 'de: 'cx> Visitor<'de> for NotebookBuilder<'cx> {
                                 .ok_or_else(|| A::Error::custom("Nope"))?
                                 .into();
 
-                            let builder = CellBuilder::new(id);
-                            let cell = builder.build(&mut self.project_handle, item, &mut self.cx);
+                            let cell = CellBuilder::new(id)
+                                .process_map(item, &self.project_handle, &mut self.cx)
+                                .build();
+
                             self.cells.push_cell(cell, &())
                         }
                     }
