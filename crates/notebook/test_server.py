@@ -1,28 +1,16 @@
-from abc import ABC, ABCMeta
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 import asyncio
-from asyncio.taskgroups import TaskGroup
-from asyncio.tasks import sleep
-from enum import Enum
-from functools import cached_property, lru_cache, partial
 import logging
 import signal
-from subprocess import CompletedProcess
 import sys
+
+from abc import ABC, ABCMeta
+from asyncio.taskgroups import TaskGroup
+from asyncio.tasks import sleep
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
-from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Protocol, Tuple, Type, get_type_hints, Union, Callable
-from typing_extensions import TypeVarTuple
-from functools import reduce, wraps
-from typing import Any, Callable, TypeVar
-from typing_extensions import ParamSpec
-from more_itertools import one
-from more_itertools.more import filter_map
-
-
-try:
-    import rich
-except ModuleNotFoundError:
-    logging.warning("Module `rich` not available, printing will not be pretty")
+from enum import Enum
+from functools import lru_cache, partial, reduce, wraps
+from typing import Any, TypeVar, Dict, Iterable, Iterator, List, Literal, Optional, Protocol, Tuple, Type, get_type_hints, Union, Callable
 
 from jupyter_client.asynchronous.client import AsyncKernelClient
 from jupyter_client.kernelspec import KernelSpecManager
@@ -34,7 +22,15 @@ from pydantic import (
     model_validator,
 )
 from pydantic.functional_validators import BeforeValidator, field_validator
-from typing_extensions import Annotated, TypeVar
+
+try:
+    import rich
+except ModuleNotFoundError:
+    logging.warning("Module `rich` not available, printing will not be pretty")
+
+from typing_extensions import Annotated, ParamSpec, TypeVarTuple
+from more_itertools import one
+from more_itertools.more import filter_map
 
 
 _C = TypeVar("_C", bound="FromString")
@@ -205,12 +201,10 @@ class KernelConnection:
                 except Exception as e:
                     print(e)
 
-
         def callback(fut: Future):
             if (e := fut.exception()) is not None:
                 print(f"Error: {e}")
             print(f"{fut.result()=}")
-
 
         return self._executor.submit(partial(asyncio.run, task()))
 
@@ -219,33 +213,6 @@ class KernelConnection:
             raise ValueError("Cannot reset handler without specifying `evict=True`")
 
         self._handlers[msg_type] = handler
-
-
-async def main():
-    conn = KernelConnection(kernel_id="python3")
-    kernelspecs = conn.spec_manager().get_all_specs()
-    print(f"{kernelspecs=}")
-
-    def stream_handler(msg: Message):
-        if msg.content.name == "stdout":
-            raise ValueError("Got the message")
-            print(msg.content.text)
-
-    conn.set_message_handler(IoPubSubChannelMessage, stream_handler)
-
-    def shutdown(signal, frame):
-        conn.shutdown_blocking()
-
-    signal.signal(signal.SIGINT, shutdown)
-
-    await conn.start_kernel()
-    asyncio.create_task(conn.listen())
-    await conn.client.wait_for_ready()
-
-    code = "print('Hello World')"
-    msg_id = conn.execute_code(code=code)
-    print(f"{msg_id=}")
-    await sleep(10)
 
 
 _T = TypeVar("_T")
@@ -258,7 +225,3 @@ def try_(f: Callable[_P, _T], default: Optional[_T] = None) -> Callable[_P, Opti
             return default
 
     return wrapper
-
-
-# if __name__ == "__main__":
-#     asyncio.run(main())

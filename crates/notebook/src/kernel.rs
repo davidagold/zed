@@ -1,19 +1,12 @@
 use anyhow::{anyhow, Result};
-
 use futures::{select, FutureExt};
 use gpui::{AsyncAppContext, Task};
 use log::{error, info};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
-use pyo3::{
-    pyclass,
-    types::{PyAnyMethods, PyDict, PyString},
-    Bound, Py, PyAny, PyResult, Python,
-};
+use pyo3::types::{PyAnyMethods, PyDict, PyString, PyTuple};
+use pyo3::{pyclass, Bound, Py, PyAny, PyResult, Python};
 
-use serde::Deserialize;
-use serde::{self, de::Error};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -21,66 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::common::{forward_err_with, forward_with_print};
 use crate::do_in;
 use crate::jupyter::message::{IoPubSubMessageType, Message, MessageType};
-
-macro_rules! kwargs {
-    ($py:ident, { $( $key:literal => $val:expr $(,)? )* }) => {
-        {
-            (|py| -> PyResult<Bound<'_, PyDict>> {
-                fn __kwargs<'py>(py: Python<'py>) -> Bound<'py, PyDict> {
-                    PyDict::new_bound(py)
-                }
-                let kwargs = __kwargs(py);
-                $(
-                    let key = PyString::new_bound(py, $key);
-                    kwargs.set_item(key, &$val)?;
-                )*
-
-                Ok(kwargs)
-            })($py)
-        }
-    }
-}
-
-struct Pydantic<'py>(&'py Bound<'py, PyAny>);
-
-impl<'a> Pydantic<'a> {
-    fn deserialize<M: for<'de> Deserialize<'de>>(&self) -> Result<M, serde_json::Error> {
-        let json = match do_in!(|py| {
-            let kwargs = &kwargs!(py, { "exclude_none" => true })?;
-            self.0
-                .call_method("model_dump_json", (), Some(&kwargs))
-                .map(|obj| obj.to_string())
-        }) {
-            Ok(json) => json,
-            Err(err) => {
-                do_in!(|py| err.print(py));
-                return Err(serde_json::Error::custom("Failed to dump model"));
-            }
-        };
-        serde_json::from_str::<M>(json.as_str())
-    }
-}
-
-pub(crate) trait TryAsStr {
-    fn __str__(&self) -> Option<String>;
-}
-
-impl TryAsStr for Py<PyAny> {
-    fn __str__(&self) -> Option<String> {
-        do_in!(|py| -> Option<String> {
-            let method = self.getattr(py, PyString::new_bound(py, "__str__")).ok()?;
-            let result = method.call_bound(py, (), None).ok()?;
-            let py_string = result.downcast_bound::<PyString>(py).ok()?;
-            py_string.extract::<String>().ok()
-        })
-    }
-}
-
-impl TryAsStr for Bound<'_, PyAny> {
-    fn __str__(&self) -> Option<String> {
-        self.clone().unbind().__str__()
-    }
-}
+use crate::jupyter::python::{Pydantic, TryAsStr};
+use crate::kwargs;
 
 pub struct JupyterKernelClient {
     command_tx: mpsc::Sender<KernelCommand>,
@@ -357,10 +292,8 @@ impl JupyterKernelClient {
                     match cmd {
                         Some(Ping { tx }) => {
                             do_in!(|| tx.send(()).ok()?);
-                            info!("Pong");
                         }
                         Some(Run { code }) => {
-                            info!("Received code: {}", code);
                             do_in!(|py| {
                                 match conn.call_method1(py, "execute_code", (code,)) {
                                     Ok(response) => {

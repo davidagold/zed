@@ -7,7 +7,7 @@ mod kernel;
 
 use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
-use crate::kernel::TryAsStr;
+use crate::jupyter::python::TryAsStr;
 use anyhow::anyhow;
 use cell::CellBuilder;
 use collections::HashMap;
