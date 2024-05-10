@@ -1,4 +1,5 @@
 from abc import ABC, ABCMeta
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 import asyncio
 from asyncio.taskgroups import TaskGroup
 from asyncio.tasks import sleep
@@ -158,10 +159,14 @@ class KernelConnection:
         self._handlers: Dict[Type[MessageType], MessageHandler] = {}
         self._ksm = KernelSpecManager()
         self._km = AsyncKernelManager()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._client = None
 
-    @cached_property
+    @property
     def client(self) -> AsyncKernelClient:
-        return self._km.client(kernel_id=self.kernel_id)
+        if self._client is None:
+            self._client = self._km.client(kernel_id=self.kernel_id)
+        return self._client
 
     def spec_manager(self) -> KernelSpecManager:
         return self._ksm
@@ -171,7 +176,6 @@ class KernelConnection:
 
     async def start_kernel(self):
         await self._km.start_kernel(kernel_id=self.kernel_id)
-        # client = self._km.client(kernel_id=self.kernel_id)
         self.client.start_channels()
         await self.client.wait_for_ready()
         print("Ready")
@@ -189,21 +193,31 @@ class KernelConnection:
         sys.exit(0)
 
     async def listen(self):
-        print("Starting listener task")
-        while True:
-            msg = Message.validate(await self.client.get_iopub_msg())
-            # rich.print(msg)
-            print(msg)
-            if (handler := self._handlers.get(type(msg.msg_type), None)) is not None:
-                handler(msg)
+        async def task():
+            print("Starting listener task")
+            while True:
+                try:
+                    msg = Message.validate(await self.client.get_iopub_msg())
+                    if (handler := self._handlers.get(type(msg.msg_type), None)) is not None:
+                        handler(msg)
+                    print("Got message!")
+                except Exception as e:
+                    print(e)
 
+
+        def callback(fut: Future):
+            if (e := fut.exception()) is not None:
+                print(f"Error: {e}")
+            print(f"{fut.result()=}")
+
+
+        return self._executor.submit(partial(asyncio.run, task()))
 
     def set_message_handler(self, msg_type: Type[MessageType], handler: MessageHandler, evict: bool = False):
         if msg_type in self._handlers and not evict:
             raise ValueError("Cannot reset handler without specifying `evict=True`")
 
         self._handlers[msg_type] = handler
-
 
 
 async def main():
@@ -216,7 +230,7 @@ async def main():
             raise ValueError("Got the message")
             print(msg.content.text)
 
-    conn.set_message_handler(IoPubSubChannelMessage.Stream, stream_handler)
+    conn.set_message_handler(IoPubSubChannelMessage, stream_handler)
 
     def shutdown(signal, frame):
         conn.shutdown_blocking()
@@ -233,32 +247,16 @@ async def main():
     await sleep(10)
 
 
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
+def try_(f: Callable[_P, _T], default: Optional[_T] = None) -> Callable[_P, Optional[_T]]:
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Optional[_T]:
+        try:
+            return f(*args, **kwargs)
+        except Exception:
+            return default
 
-# _T = TypeVar("_T")
-# _P = ParamSpec("_P")
-# def try_(f: Callable[_P, _T], default: Optional[_T] = None) -> Callable[_P, Optional[_T]]:
-#     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Optional[_T]:
-#         try:
-#             return f(*args, **kwargs)
-#         except Exception:
-#             return default
-
-#     return wrapper
-
-
-# # _T = TypeVar("_T")
-# # _Us = TypeVarTuple("_Us")
-# # _P = ParamSpec("_P")
-
-
-# # def compose(*funcs: *tuple[Callable[..., _T], *_Us, Callable[_P, Any]]) -> Callable[_P, _T]:
-# #     func_last, *funcs, func_first = funcs
-
-# #     @wraps(func_first)
-# #     def composed(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-# #         return reduce(lambda x, f: f(x), [*reversed(funcs), func_last], func_first(*args, **kwargs))
-
-# #     return composed
+    return wrapper
 
 
 # if __name__ == "__main__":

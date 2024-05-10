@@ -204,7 +204,7 @@ impl Coroutine {
                 ));
 
                 event_loop
-                    .call_method1("create_task", (coro.call0(py)?,))
+                    .call_method1("run_until_complete", (coro.call0(py)?,))
                     .map(|obj| obj.unbind())
             }) {
                 Ok(result) => Ok(result),
@@ -292,11 +292,17 @@ impl JupyterKernelClient {
             info!("We did it!")
         };
 
-        match do_in!(|py| -> PyResult<Task<_>> {
+        let listener = match do_in!(|py| -> PyResult<Task<_>> {
             let coro = conn.call_method0(py, "listen")?;
             Ok(Coroutine::schedule(coro, Some(Callback::new()), &cx))
         }) {
-            Ok(task) => task.detach(),
+            Ok(task) => match task.await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    do_in!(|py| err.print(py));
+                    return Err(anyhow!(err));
+                }
+            },
             Err(err) => {
                 do_in!(|py| err.print(py));
                 return Err(anyhow!(err));
@@ -315,18 +321,15 @@ impl JupyterKernelClient {
             do_in!(|py| err.print(py));
         }
 
-        // do_in!(|py| {
-        //     Some(info!(
-        //         "Handlers: {:#?}",
-        //         conn.getattr(py, "_handlers").ok()?.__str__()?
-        //     ))
-        // });
-
         info!("[JupyterKernelClient task] Starting inner loop");
         loop {
             cx.background_executor()
                 .timer(Duration::from_millis(5))
                 .await;
+            do_in!(|py| -> Option<_> {
+                Some(listener.call_method0(py, "running").ok()?.__str__()?)
+            });
+
             select! {
                 msg = conn_rx.recv().fuse() => {
                     info!("Hello!");
