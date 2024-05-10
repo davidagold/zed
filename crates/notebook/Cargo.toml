@@ -15,7 +15,6 @@ doctest = false
 # async-trait = { workspace = true, "optional" = true }
 # regex.workspace = true
 anyhow.workspace = true
-async-compat = { version = "0.2.1", "optional" = true }
 collections.workspace = true
 command_palette_hooks.workspace = true
 editor.workspace = true
@@ -27,11 +26,11 @@ languages.workspace = true
 log.workspace = true
 multi_buffer.workspace = true
 project.workspace = true
+pyo3 = { version = "0.21.2", features = ["experimental-async"] }
 regex.workspace = true
 rope.workspace = true
 rpc.workspace = true
 runtimelib = { git = "https://github.com/runtimed/runtimed", version = "0.1.0" }
-schemars.workspace = true
 search.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
@@ -48,16 +47,3 @@ util.workspace = true
 workspace.workspace = true
 worktree.workspace = true
 zed_actions.workspace = true
-
-[dev-dependencies]
-command_palette.workspace = true
-editor = { workspace = true, features = ["test-support"] }
-gpui = { workspace = true, features = ["test-support"] }
-release_channel.workspace = true
-indoc.workspace = true
-language = { workspace = true, features = ["test-support"] }
-lsp = { workspace = true, features = ["test-support"] }
-parking_lot.workspace = true
-settings.workspace = true
-util = { workspace = true, features = ["test-support"] }
-workspace = { workspace = true, features = ["test-support"] }

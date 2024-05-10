@@ -1,6 +1,7 @@
 use log::error;
 
 use anyhow::anyhow;
+use pyo3::{PyErr, Python};
 use serde::de::DeserializeOwned;
 
 pub(crate) fn parse_value<T: DeserializeOwned, E: serde::de::Error>(
@@ -32,10 +33,37 @@ where
 /// ```
 #[macro_export]
 macro_rules! do_in {
+    (|| $body:expr) => {{
+        (|| -> Option<_> {
+            //
+            { $body }.into()
+        })()
+    }};
+
+    (|$py:ident $(:Python)?| $body:expr) => {{
+        Python::with_gil(|py| (|$py: Python| $body)(py))
+    }};
+
+    (|$py:ident| -> $ret:ty $body:block) => {{
+        Python::with_gil(|py| -> $ret { (|$py: Python| $body)(py) })
+    }};
+
+    (|| $body:block) => {{
+        (|| -> Option<_> {
+            //
+            { $body }.into()
+        })()
+    }};
+
     (|| -> $ret:ty $body:block) => {{
         (|| -> $ret {
             //
             { $body }.into()
         })()
     }};
+}
+
+pub(crate) fn forward_with_print<T>(err: PyErr) -> anyhow::Result<T> {
+    do_in!(|py| err.print(py));
+    Err(anyhow!(err))
 }

@@ -6,11 +6,14 @@ name = "pypi"
 [packages]
 jupyter-server = "*"
 jupyter-client = "*"
+ipykernel = "*"
+pydantic = "*"
+more-itertools = "*"
 
 [dev-packages]
-pydantic = "*"
 rich = "*"
+ruff = "*"
 
 [requires]
-python_version = "3.11"
-python_full_version = "3.11.7"
+python_version = "3.12"
+python_full_version = "3.12.2"
