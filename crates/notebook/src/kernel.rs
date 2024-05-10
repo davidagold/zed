@@ -1,8 +1,5 @@
-use std::sync::OnceLock;
-use std::time::Duration;
-
 use anyhow::{anyhow, Result};
-use collections::HashMap;
+
 use futures::{select, FutureExt};
 use gpui::{AsyncAppContext, Task};
 use log::{error, info};
@@ -14,16 +11,16 @@ use pyo3::{
     types::{PyAnyMethods, PyDict, PyString},
     Bound, Py, PyAny, PyResult, Python,
 };
-use runtimelib::media::MimeType;
+
 use serde::Deserialize;
-use serde_json::Value;
+use serde::{self, de::Error};
+use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::common::forward_err_with;
-use crate::{
-    cell::{MimeData, StreamOutputTarget},
-    do_in,
-};
+use crate::common::{forward_err_with, forward_with_print};
+use crate::do_in;
+use crate::jupyter::message::{IoPubSubMessageType, Message, MessageType};
 
 macro_rules! kwargs {
     ($py:ident, { $( $key:literal => $val:expr $(,)? )* }) => {
@@ -41,6 +38,26 @@ macro_rules! kwargs {
                 Ok(kwargs)
             })($py)
         }
+    }
+}
+
+struct Pydantic<'py>(&'py Bound<'py, PyAny>);
+
+impl<'a> Pydantic<'a> {
+    fn deserialize<M: for<'de> Deserialize<'de>>(&self) -> Result<M, serde_json::Error> {
+        let json = match do_in!(|py| {
+            let kwargs = &kwargs!(py, { "exclude_none" => true })?;
+            self.0
+                .call_method("model_dump_json", (), Some(&kwargs))
+                .map(|obj| obj.to_string())
+        }) {
+            Ok(json) => json,
+            Err(err) => {
+                do_in!(|py| err.print(py));
+                return Err(serde_json::Error::custom("Failed to dump model"));
+            }
+        };
+        serde_json::from_str::<M>(json.as_str())
     }
 }
 
@@ -106,8 +123,8 @@ impl Callback {
 
 #[pymethods]
 impl Callback {
-    #[pyo3(signature = (*args, **kwargs))]
-    fn __call__(&mut self, args: Py<PyTuple>, kwargs: Option<Py<PyDict>>) -> PyResult<()> {
+    #[pyo3(signature = (*args))]
+    fn __call__(&mut self, args: Py<PyTuple>) -> PyResult<()> {
         do_in!(|py| -> PyResult<_> {
             let (fut,) = args.extract::<(Py<PyAny>,)>(py)?;
             let result = fut.call_method0(py, "result")?;
@@ -126,12 +143,9 @@ struct Coroutine {
 
 #[pymethods]
 impl Coroutine {
-    #[pyo3(signature = (*args, **kwargs))]
-    async fn __call__(
-        &mut self,
-        args: Py<PyTuple>,
-        kwargs: Option<Py<PyDict>>,
-    ) -> PyResult<Py<PyAny>> {
+    // #[pyo3(signature = (*args, **kwargs))]
+    #[pyo3(signature = ())]
+    async fn __call__(&mut self) -> PyResult<Py<PyAny>> {
         match do_in!(|py| -> PyResult<_> {
             let event_loop = get_running_loop(py)?;
             let fut = ensure_future(py, &self.coro, Some(&event_loop))?;
@@ -218,26 +232,30 @@ impl Coroutine {
 }
 
 #[pyclass]
-struct IoPubsubMessageHandler {
-    tx: mpsc::Sender<String>,
+struct MessageHandler {
+    tx: mpsc::Sender<Message>,
 }
 
-impl IoPubsubMessageHandler {
-    fn new() -> (IoPubsubMessageHandler, mpsc::Receiver<String>) {
+impl MessageHandler {
+    fn new() -> (MessageHandler, mpsc::Receiver<Message>) {
         let (tx, rx) = mpsc::channel(1024);
-        (IoPubsubMessageHandler { tx }, rx)
+        (MessageHandler { tx }, rx)
     }
 }
 
 #[pymethods]
-impl IoPubsubMessageHandler {
-    #[pyo3(signature = (msg))]
-    fn __call__<'py>(&self, py: Python<'py>, msg: &Bound<'py, PyAny>) -> PyResult<()> {
-        do_in!(|| info!("Handler called with message: {}", msg.__str__()?));
-        let serialized = py.import_bound("json")?.getattr("dumps")?.call1((msg,))?;
-        self.tx.try_send(serialized.extract()?).map_err(|err| {
-            PyRuntimeError::new_err(format!("Failed to send message: {:#?}", err.to_string()))
-        })
+impl MessageHandler {
+    #[pyo3(signature = (py_msg))]
+    fn __call__<'py>(&self, py_msg: &Bound<'py, PyAny>) -> PyResult<()> {
+        match Pydantic(py_msg).deserialize::<Message>() {
+            Ok(msg) => self.tx.try_send(msg).map_err(|err| {
+                PyRuntimeError::new_err(format!("Failed to send message: {:#?}", err.to_string()))
+            }),
+            Err(err) => Err(PyRuntimeError::new_err(format!(
+                "Failed to deserialize message: {:#?}",
+                err
+            ))),
+        }
     }
 }
 
@@ -286,11 +304,7 @@ impl JupyterKernelClient {
             }
         };
 
-        if let Err(err) = task.await {
-            do_in!(|py| err.print(py))
-        } else {
-            info!("We did it!")
-        };
+        let _ = task.await.map_err(forward_with_print::<()>);
 
         let listener = match do_in!(|py| -> PyResult<Task<_>> {
             let coro = conn.call_method0(py, "listen")?;
@@ -298,18 +312,12 @@ impl JupyterKernelClient {
         }) {
             Ok(task) => match task.await {
                 Ok(listener) => listener,
-                Err(err) => {
-                    do_in!(|py| err.print(py));
-                    return Err(anyhow!(err));
-                }
+                Err(err) => return forward_with_print(err),
             },
-            Err(err) => {
-                do_in!(|py| err.print(py));
-                return Err(anyhow!(err));
-            }
+            Err(err) => return forward_with_print(err),
         };
 
-        let (io_pubsub_handler, mut conn_rx) = IoPubsubMessageHandler::new();
+        let (io_pubsub_handler, mut conn_rx) = MessageHandler::new();
         if let Err(err) = do_in!(|py| {
             let io_pubsub_msg_type = py
                 .import_bound("test_server")?
@@ -332,8 +340,17 @@ impl JupyterKernelClient {
 
             select! {
                 msg = conn_rx.recv().fuse() => {
-                    info!("Hello!");
-                    do_in!(|| info!("Received message {}", msg?));
+                    let Some(msg) = msg else {
+                        continue
+                    };
+                    use MessageType::*;
+                    use IoPubSubMessageType::*;
+                    match msg.msg_type {
+                        IoPubSub(Stream) => {
+                            info!("{:#?}", msg);
+                        },
+                        _ => continue
+                    }
                 }
                 cmd = rx.recv().fuse() => {
                     use KernelCommand::*;
@@ -364,8 +381,8 @@ impl JupyterKernelClient {
     }
 }
 
+// TODO: Decide whether to include these or save them for later
 struct KernelId(String);
-
 enum KernelState {
     Stopped,
     Starting,
@@ -382,7 +399,6 @@ enum KernelCommand {
     Interrupt {},
     Run { code: String },
     Ping { tx: oneshot::Sender<()> },
-    // Log { rx: oneshot::Sender<String> },
     Log { text: String },
 }
 
@@ -395,49 +411,4 @@ impl KernelCommand {
     fn run(code: String) -> KernelCommand {
         KernelCommand::Run { code }
     }
-}
-
-struct JupyterMessageHeader {
-    msg_id: String,
-    session: String,
-    username: String,
-    date: String,
-    msg_type: String,
-    version: String,
-}
-
-struct JupyterMessage {
-    header: JupyterMessageHeader,
-    msg_id: String,
-    msg_type: String,
-    parent_header: JupyterMessageHeader,
-    metadata: HashMap<String, Value>,
-    content: HashMap<String, Value>,
-    buffers: Vec<Vec<u8>>,
-}
-
-#[derive(Deserialize)]
-enum JupyterMessageContent {
-    #[serde(alias = "stream")]
-    Stream {
-        name: StreamOutputTarget,
-        text: String,
-    },
-    #[serde(alias = "display_data")]
-    DisplayData {
-        data: HashMap<MimeType, MimeData>,
-        metadata: HashMap<MimeType, Value>,
-        transient: HashMap<String, Value>,
-    },
-    #[serde(alias = "execute_input")]
-    ExecutionInput {
-        code: String,
-        execution_count: usize,
-    },
-    #[serde(alias = "execute_result")]
-    ExecutionResult {
-        execution_count: usize,
-        data: HashMap<MimeType, MimeData>,
-        metadata: HashMap<MimeType, Value>,
-    },
 }

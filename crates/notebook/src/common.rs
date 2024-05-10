@@ -1,6 +1,7 @@
 use log::error;
 
 use anyhow::anyhow;
+use pyo3::{PyErr, Python};
 use serde::de::DeserializeOwned;
 
 pub(crate) fn parse_value<T: DeserializeOwned, E: serde::de::Error>(
@@ -60,4 +61,9 @@ macro_rules! do_in {
             { $body }.into()
         })()
     }};
+}
+
+pub(crate) fn forward_with_print<T>(err: PyErr) -> anyhow::Result<T> {
+    do_in!(|py| err.print(py));
+    Err(anyhow!(err))
 }

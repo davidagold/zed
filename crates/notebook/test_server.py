@@ -10,7 +10,7 @@ import signal
 from subprocess import CompletedProcess
 import sys
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Literal, Optional, Protocol, Type, get_type_hints, Union, Callable
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Protocol, Tuple, Type, get_type_hints, Union, Callable
 from typing_extensions import TypeVarTuple
 from functools import reduce, wraps
 from typing import Any, Callable, TypeVar
@@ -45,8 +45,9 @@ class FromString(Enum):
         print(res)
         return res
 
+
 class Message(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
 
     header: "MessageHeader"
     msg_id: str
@@ -98,6 +99,7 @@ class ShellChannelMessage(MessageType, FromString):
     KernelInfoRequest = "kernel_info_request"
     KernelInfoReply = "kernel_info_reply"
 
+
 class IoPubSubChannelMessage(MessageType, FromString):
     Stream = "stream"
     DisplayData = "display_data"
@@ -117,7 +119,7 @@ class KernelStatus(Enum):
 
 
 class MessageHeader(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
 
     msg_id: str
     session: str
@@ -200,7 +202,6 @@ class KernelConnection:
                     msg = Message.validate(await self.client.get_iopub_msg())
                     if (handler := self._handlers.get(type(msg.msg_type), None)) is not None:
                         handler(msg)
-                    print("Got message!")
                 except Exception as e:
                     print(e)
 

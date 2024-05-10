@@ -2,6 +2,7 @@ pub mod actions;
 pub mod cell;
 mod common;
 pub mod editor;
+mod jupyter;
 mod kernel;
 
 use crate::cell::{Cells, KernelSpec};
@@ -289,7 +290,6 @@ impl project::Item for Notebook {
                 let version = sys.getattr("version")?;
 
                 let path = "/Users/davidgold/Projects/zed/crates/notebook";
-                let insert = sys.getattr("path")?;
                 sys.getattr("path")?.call_method1("insert", (0, path))?;
                 do_in!(|| {
                     info!("Found Python version: {}", version.__str__()?);
@@ -297,26 +297,11 @@ impl project::Item for Notebook {
                     info!("Python executable: {}", exec.__str__()?);
                 });
 
-                let module = py.import_bound("test_server")?;
-                do_in!(|| info!("module: {:#?}", module.__str__()?));
-                let conn = match module.getattr("KernelConnection") {
-                    Ok(conn) => {
-                        info!("`KernelConnection`: {:#?}", conn);
-                        conn
-                    }
-                    Err(err) => {
-                        error!("{:#?}", err);
-                        do_in!(|py| err.print(py));
-                        return Err(err);
-                    }
-                };
-                do_in!(|| info!("`KernelConnection`: {:#?}", conn.__str__()?));
-
                 let pythonpath = sys.getattr("path")?.extract::<Vec<String>>()?;
-                let str_python_path = serde_json::to_string_pretty(&pythonpath)
-                    .expect("Failed to serialize `sys.path`.");
-
-                info!("Found Python path: {str_python_path}");
+                do_in!(|| {
+                    let str_python_path = serde_json::to_string_pretty(&pythonpath).ok()?;
+                    info!("Found Python path: {str_python_path}");
+                });
 
                 Ok(())
             }) {
