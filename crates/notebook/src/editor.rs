@@ -1,25 +1,34 @@
 //! Jupyter support for Zed.
 
+use anyhow::anyhow;
 use editor::{items::entry_label_color, Editor, EditorEvent, ExcerptId, MAX_TAB_TITLE_LEN};
 use gpui::{
-    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
-    Subscription, View,
+    AnyView, AppContext, AsyncAppContext, EventEmitter, FocusHandle, FocusableView, Model,
+    ParentElement, Result, Subscription, View,
 };
-use log::info;
+use language::Buffer;
+use log::{error, info};
 use project::{self, Project};
+use rpc::proto::Message;
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
 };
 use ui::{
-    div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
-    SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
+    Render, SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
-use crate::{actions, kernel::KernelCommand, Notebook};
+use crate::{
+    actions,
+    cell::CellId,
+    do_in,
+    kernel::{KernelCommand, KernelEvent},
+    Notebook,
+};
 
 pub struct NotebookEditor {
     notebook: Model<Notebook>,
@@ -50,27 +59,37 @@ impl NotebookEditor {
         // TODO: Figure out what goes here.
         // cx.on_focus_out(&focus_handle, |this, cx| {})
         // .detach();
+        //
+        let mut subscriptions = Vec::<Subscription>::new();
 
-        let subscription = cx.subscribe(&project, |_this, _project, event, _cx| {
+        subscriptions.push(cx.subscribe(&project, |_this, _project, event, _cx| {
             log::info!("Event: {:#?}", event);
-        });
-
-        cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
-            cx.emit(event.clone());
-            match event {
-                EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
-                _ => {
-                    log::info!("Event: {:#?}", event);
+        }));
+        subscriptions.push(
+            cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
+                try_init_kernel_client(event.clone());
+                match event {
+                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                    _ => {
+                        log::info!("Event: {:#?}", event);
+                    }
                 }
-            }
-        })
-        .detach();
+            }),
+        );
+        notebook.read(cx).client_handle.inspect(|client_handle| {
+            subscriptions.push(cx.subscribe(
+                client_handle,
+                |this, client_handle, event: &KernelEvent, cx| {
+                    //
+                },
+            ));
+        });
 
         NotebookEditor {
             notebook,
             editor,
             focus_handle,
-            _subscriptions: [subscription].into(),
+            _subscriptions: subscriptions,
         }
     }
 
@@ -79,25 +98,52 @@ impl NotebookEditor {
             return ();
         };
 
-        let mut cursor = self.notebook.read(cx).cells.cursor::<ExcerptId>();
-        cursor.seek_forward(&excerpt_id, text::Bias::Left, &());
-        // cursor.next(&());
-        info!("Cursor: {:#?}", cursor.item());
+        do_in!(|| {
+            let notebook = self.notebook.read(cx);
+            let current_cell = notebook.cells.get_by_excerpt_id(&excerpt_id)?;
+            match notebook.client_handle?.read(cx).run_cell(current_cell, cx) {
+                Ok(response) => info!("{:#?}", response),
+                Err(err) => error!("{:#?}", err),
+            };
+        });
+    }
 
-        let cells = &self.notebook.read(cx).cells;
-        // info!("Cells: {:#?}", cells.tree);
+    fn insert_after_cell_with_id(
+        &mut self,
+        cell_id: &CellId,
+        cx: &mut AsyncAppContext,
+    ) -> Model<Buffer> {
+        // cx.update(|cx| {
+        //     cx.
+        // })
+        // self.editor.update(, |editor, cx| {})
+    }
 
-        // info!("Summary of cells: {:#?}", cells.summary());
+    pub(crate) async fn update_cell_outputs<'a>(
+        &self,
+        cell_id: &CellId,
+        msg: Message,
+        cx: &mut ViewContext<'a, Self>,
+    ) -> Result<()> {
+        let Some(cell) = self.notebook.read(cx).cells.get_cell_by_id(cell_id) else {
+            return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
+        };
 
-        // self.notebook.read(cx).kernel_client.
-        // let entity_id = cx.entity_id();
-        // let buffer = buffer_handle.read(cx);
-        // log::info!(
-        //     "Active cell's `NotebookEditor`'s `EntityId`: {:#?}",
-        //     entity_id
-        // );
-        log::info!("Active cell's `ExcerptId`: {:#?}", excerpt_id);
-        // log::info!("Active cell's buffer: {:#?}", buffer.text());
+        let output_buffer_handle = match cell.output_content {
+            Some(buffer_handle) => buffer_handle,
+            None => self.insert_after_cell_with_id(&cell.id, cx),
+        };
+        // TODO: We need to check the parent message ID/execution count to ensure we only clear cell outputs
+        //       upon a new execution.
+        cx.update_model(&output_buffer_handle, |buffer, cx| {
+            //
+        });
+        //     // let excerpt_id = cell.
+
+        //     Ok(())
+        // });
+
+        Ok(())
     }
 
     fn toggle_notebook_view(&mut self, cmd: &super::actions::ToggleNotebookView) {}

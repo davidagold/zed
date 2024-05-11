@@ -11,7 +11,7 @@ use crate::jupyter::python::TryAsStr;
 use anyhow::{anyhow, Result};
 use cell::{Cell, CellBuilder};
 use collections::HashMap;
-use gpui::{AsyncAppContext, Context, WeakModel};
+use gpui::{AsyncAppContext, Context, Model, WeakModel};
 use kernel::JupyterKernelClient;
 use language::Language;
 use log::{error, info};
@@ -35,7 +35,7 @@ pub struct Notebook {
     pub nbformat: usize,
     pub nbformat_minor: usize,
     pub cells: Cells,
-    pub kernel_client: Option<Arc<JupyterKernelClient>>,
+    pub client_handle: Option<Model<JupyterKernelClient>>,
 }
 
 impl Notebook {
@@ -45,9 +45,9 @@ impl Notebook {
         })
     }
 
-    async fn try_set_kernel_client(&mut self, cx: &AsyncAppContext) -> anyhow::Result<()> {
-        let kc = JupyterKernelClient::new(cx.clone()).await?;
-        self.kernel_client.replace(Arc::new(kc));
+    async fn try_set_kernel_client(&mut self, cx: &mut AsyncAppContext) -> anyhow::Result<()> {
+        self.client_handle
+            .replace(JupyterKernelClient::new_model(cx.clone()).await?);
         Ok(())
     }
 
@@ -139,7 +139,7 @@ impl<'cx> NotebookBuilder<'cx> {
             nbformat: self.nbformat.unwrap(),
             nbformat_minor: self.nbformat_minor.unwrap(),
             cells: Cells::from_builders(self.cell_builders, self.cx)?,
-            kernel_client: None,
+            client_handle: None,
         };
 
         let _ = notebook

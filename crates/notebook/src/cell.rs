@@ -1,4 +1,4 @@
-use crate::do_in;
+use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use editor::{ExcerptId, ExcerptRange, MultiBuffer};
@@ -227,14 +227,6 @@ pub struct Cells {
 }
 
 impl Cells {
-    pub(crate) fn empty(cx: &mut AsyncAppContext) {
-        let mut celltree = SumTree::<Cell>::new();
-    }
-
-    pub fn push_cell(&mut self, cell: Cell, cx: &<CellSummary as Summary>::Context) {
-        self.tree.push(cell, cx);
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &Cell> {
         self.tree.iter()
     }
@@ -248,6 +240,18 @@ impl Cells {
         D: Dimension<'a, CellSummary>,
     {
         self.tree.cursor::<D>()
+    }
+
+    pub fn get_by_excerpt_id(&self, excerpt_id: &ExcerptId) -> Option<&Cell> {
+        let mut cursor = self.cursor::<ExcerptId>();
+        cursor.seek_forward(excerpt_id, text::Bias::Left, &());
+        cursor.item()
+    }
+
+    pub fn get_cell_by_id(&self, cell_id: &CellId) -> Option<&Cell> {
+        let mut cursor = self.cursor::<CellId>();
+        cursor.seek_forward(cell_id, text::Bias::Left, &());
+        cursor.item()
     }
 
     pub fn from_builders<'c>(
@@ -324,6 +328,16 @@ impl<'a> Dimension<'a, CellSummary> for ExcerptId {
     }
     fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
         summary.trailing_excerpt_id
+    }
+}
+
+impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for CellId {
+    fn cmp(
+        &self,
+        cursor_location: &CellSummary,
+        cx: &<CellSummary as Summary>::Context,
+    ) -> std::cmp::Ordering {
+        Ord::cmp(self, &cursor_location.trailing_cell_id)
     }
 }
 

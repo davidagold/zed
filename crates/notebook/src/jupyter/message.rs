@@ -16,7 +16,7 @@ pub struct Message {
     pub(crate) msg_type: MessageType,
     pub(crate) parent_header: MessageHeader,
     pub(crate) metadata: HashMap<String, Value>,
-    pub(crate) content: MessageContent,
+    pub(crate) content: HashMap<String, Value>,
     pub(crate) buffers: Vec<Vec<u8>>,
 }
 
@@ -143,8 +143,7 @@ pub enum IoPubSubMessageType {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MessageContent {
+pub enum IoPubSubMessageContent {
     #[serde(alias = "stream")]
     Stream {
         name: StreamOutputTarget,
