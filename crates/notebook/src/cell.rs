@@ -91,22 +91,17 @@ impl CellBuilder {
                         }?;
 
                         project_handle
-                            .update(cx, |project, project_cx| -> Result<()> {
+                            .update(cx, |project, cx| -> Result<()> {
                                 let mut source_text = source_lines.join("\n");
                                 source_text.push_str("\n");
-                                let source_buffer = project.create_buffer(
-                                    source_text.as_str(),
-                                    None,
-                                    project_cx,
-                                )?;
-
+                                let source_buffer =
+                                    cx.new_model(|cx| Buffer::local(source_text, cx));
                                 self.source.replace(source_buffer);
                                 Ok(())
                             })
                             .flatten()?;
                     }
                     "execution_count" => {
-                        // TODO: Handle this more carefully
                         self.execution_count = serde_json::from_value(val).unwrap_or_default()
                     }
                     "outputs" => {
@@ -246,7 +241,7 @@ impl Cells {
         self.tree.cursor::<D>()
     }
 
-    pub fn get_by_excerpt_id(&self, excerpt_id: &ExcerptId) -> Option<&Cell> {
+    pub fn get_cell_by_excerpt_id(&self, excerpt_id: &ExcerptId) -> Option<&Cell> {
         let mut cursor = self.cursor::<ExcerptId>();
         cursor.seek_forward(excerpt_id, text::Bias::Left, &());
         cursor.item()
@@ -269,7 +264,7 @@ impl Cells {
         let new_cell = f(old_cell)?;
         if new_cell.id != old_cell.id {
             return Err(anyhow!(
-                "New cell ID (`{:#?}`) must match old cell ID (`{:#?}`)",
+                "New cell ID (got `{:#?}`) must match old cell ID (got `{:#?}`)",
                 new_cell.id,
                 old_cell.id
             ));
@@ -322,11 +317,9 @@ impl Cells {
         let multi = cx.new_model(|model_cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
 
-            // TODO: Actually guarantee some invariance in `CellId` -> `ExcerptId`.
             let mut prev_excerpt_id = ExcerptId::min();
             for builder in builders.iter_mut() {
                 let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
-                // let cell = builder.build(prev_excerpt_id.clone());
                 builder.excerpt_id.set(excerpt_id);
                 do_in!(|| {
                     let source = builder.source.as_ref()?.clone();

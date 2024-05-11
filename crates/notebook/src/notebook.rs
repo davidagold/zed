@@ -9,7 +9,7 @@ use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
 use crate::jupyter::python::TryAsStr;
 use anyhow::{anyhow, Result};
-use cell::{Cell, CellBuilder};
+use cell::CellBuilder;
 use collections::HashMap;
 use gpui::{AsyncAppContext, Context, Model, WeakModel};
 use kernel::JupyterKernelClient;
@@ -17,11 +17,9 @@ use language::Language;
 use log::{error, info};
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
-use serde::de::{self, DeserializeSeed, Error, Visitor};
+use serde::de::{self, DeserializeSeed, Visitor};
 use serde_json::Value;
-use std::default;
-use std::{io::Read, num::NonZeroU64, sync::Arc};
-use sum_tree::SumTree;
+use std::{io::Read, sync::Arc};
 
 use project::{self, Project, ProjectPath};
 use worktree::File;
@@ -224,6 +222,7 @@ impl project::Item for Notebook {
     where
         Self: Sized,
     {
+        info!("Trying to open notebook");
         // TODO: If the workspace has an active `NotebookEditor` view for the requested `path`,
         //       we should activate the existing view.
         if !path.path.extension().is_some_and(|ext| ext == "ipynb") {

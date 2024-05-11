@@ -106,7 +106,7 @@ impl NotebookEditor {
 
         do_in!(|| {
             let notebook = self.notebook.read(cx);
-            let current_cell = notebook.cells.get_by_excerpt_id(&excerpt_id)?;
+            let current_cell = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?;
             match notebook
                 .client_handle
                 .as_ref()?

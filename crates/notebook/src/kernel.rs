@@ -157,9 +157,9 @@ impl JupyterKernelClient {
                 maybe_msg = conn_rx.recv().fuse() => {
                     match maybe_msg {
                         Some(msg) => {
-                            cx.update_model(&client_handle, |client, cx| {
-                                //
-                            });
+                            if let Err(err) = client_handle.update(&mut cx, |_client, cx| cx.emit(KernelEvent::ReceivedKernelMessage(msg))){
+                                error!("Received message but failed to emit event: {:#?}", err);
+                            }
                         },
                         None => continue
                     }
