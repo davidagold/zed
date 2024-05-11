@@ -1,27 +1,30 @@
+use crate::Notebook;
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::{ExcerptId, ExcerptRange, MultiBuffer};
-use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
-use itertools::Itertools;
+use editor::{Editor, ExcerptId, ExcerptRange, MultiBuffer};
+use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, View, WeakModel};
+use itertools::{chain, Itertools};
 use language::{Buffer, Capability, File};
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
+use std::borrow::Borrow;
+use std::cell::Cell as StdCell;
 use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
+use text::Bias;
 use ui::Context;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
-    pub id: CellId,
+    pub id: StdCell<CellId>,
     // The `msg_id` of the latest `execute_request` message sent to request the execution of the present cell
     pub(crate) latest_execute_request_msg_id: Option<String>,
 
     pub cell_id: Option<String>, // `cell_id` is a notebook field
-    _excerpt_id: std::cell::Cell<ExcerptId>,
     pub cell_type: CellType,
     pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
@@ -33,7 +36,6 @@ pub struct Cell {
 #[derive(Default)]
 pub struct CellBuilder {
     id: u64,
-    excerpt_id: std::cell::Cell<ExcerptId>,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
     metadata: Option<HashMap<String, serde_json::Value>>,
@@ -161,9 +163,8 @@ impl CellBuilder {
 
     pub fn build(self) -> Cell {
         Cell {
-            id: CellId(self.id),
+            id: CellId(self.id).into(),
             latest_execute_request_msg_id: None,
-            _excerpt_id: std::cell::Cell::new(self.excerpt_id.take()),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
             metadata: self.metadata.unwrap(),
@@ -242,8 +243,8 @@ impl Cells {
     }
 
     pub fn get_cell_by_excerpt_id(&self, excerpt_id: &ExcerptId) -> Option<&Cell> {
-        let mut cursor = self.cursor::<ExcerptId>();
-        cursor.seek_forward(excerpt_id, text::Bias::Left, &());
+        let mut cursor = self.cursor::<BlockId>();
+        cursor.seek_forward(&BlockId::from(*excerpt_id), text::Bias::Left, &());
         cursor.item()
     }
 
@@ -274,8 +275,38 @@ impl Cells {
         })
     }
 
-    fn insert_cell_after(&mut self, cell_id: CellId, cell: Cell) {
-        // TODO
+    pub(crate) fn insert_cell(
+        &mut self,
+        cell: Cell,
+        editor_view: View<Editor>,
+        cx: &mut ModelContext<Notebook>,
+    ) {
+        let mut cursor = self.tree.cursor::<CellId>();
+        let keep_as_is = cursor.slice(&cell.id.get(), Bias::Left, &());
+        let mut next_cell_id = cell.id.get().pre_inc();
+        let iter_cells = chain!(
+            keep_as_is.iter(),
+            vec![&cell].into_iter(),
+            cursor.map(|cell| {
+                cell.id.set(next_cell_id.post_inc().clone().into());
+                cell
+            }),
+        );
+        self.tree = SumTree::<Cell>::from_iter(iter_cells.map(|cell| cell.clone()), &());
+
+        let mut cursor = self.tree.cursor::<CellId>();
+        let num_excerpts_preceding: u64 = cursor
+            .summary::<CellId, BlockId>(&cell.id.get(), Bias::Left, &())
+            .into();
+        let range = excerpt_range_over_buffer(&cell.source, cx);
+        self.multi.update(cx, |multi, cx| {
+            multi.insert_excerpts_after(
+                ExcerptId::from_proto(num_excerpts_preceding),
+                cell.source,
+                vec![range],
+                cx,
+            );
+        });
     }
 
     pub(crate) fn update_cell_from_msg<C: Context>(
@@ -310,6 +341,7 @@ impl Cells {
         Ok(())
     }
 
+    // TODO: We no longer need excerpt ID to live in cell so this is just kind of confusing being down here
     pub fn from_builders<'c>(
         mut builders: Vec<CellBuilder>,
         cx: &mut AsyncAppContext,
@@ -320,7 +352,6 @@ impl Cells {
             let mut prev_excerpt_id = ExcerptId::min();
             for builder in builders.iter_mut() {
                 let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
-                builder.excerpt_id.set(excerpt_id);
                 do_in!(|| {
                     let source = builder.source.as_ref()?.clone();
                     let range = excerpt_range_over_buffer(&source, model_cx);
@@ -356,13 +387,31 @@ impl Cells {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CellSummary {
+    num_cells_inclusive: u64,
+    // A "block" is an entity whose view both
+    //   - takes up vertical space in the notebook view and
+    //   - belongs to the same `div` level as a cell in the notebook view
+    num_blocks_inclusive: u64,
+}
+
+impl Summary for CellSummary {
+    type Context = ();
+
+    fn add_summary(&mut self, summary: &Self, _cx: &Self::Context) {
+        self.num_cells_inclusive += summary.num_cells_inclusive;
+        self.num_blocks_inclusive += summary.num_blocks_inclusive;
+    }
+}
+
 impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
     fn summary(&self) -> Self::Summary {
         CellSummary {
-            trailing_cell_id: self.id,
-            trailing_excerpt_id: self._excerpt_id.get().clone(),
+            num_cells_inclusive: 1,
+            num_blocks_inclusive: 1 + (if self.output_content.is_some() { 1 } else { 0 }),
         }
     }
 }
@@ -371,25 +420,16 @@ impl sum_tree::KeyedItem for Cell {
     type Key = CellId;
 
     fn key(&self) -> Self::Key {
-        self.id.clone()
+        self.id.get()
     }
 }
 
 impl<'a> Dimension<'a, CellSummary> for CellId {
-    fn add_summary(&mut self, _summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
-        self.0 = std::cmp::max(self.0, _summary.trailing_cell_id.0);
+    fn add_summary(&mut self, summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
+        self.0 = self.0 + summary.num_cells_inclusive
     }
     fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
-        summary.trailing_cell_id
-    }
-}
-
-impl<'a> Dimension<'a, CellSummary> for ExcerptId {
-    fn add_summary(&mut self, _summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
-        *self = std::cmp::max(*self, _summary.trailing_excerpt_id)
-    }
-    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
-        summary.trailing_excerpt_id
+        CellId::from(summary.num_cells_inclusive)
     }
 }
 
@@ -399,36 +439,7 @@ impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for CellId {
         cursor_location: &CellSummary,
         cx: &<CellSummary as Summary>::Context,
     ) -> std::cmp::Ordering {
-        Ord::cmp(self, &cursor_location.trailing_cell_id)
-    }
-}
-
-impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for ExcerptId {
-    fn cmp(
-        &self,
-        cursor_location: &CellSummary,
-        cx: &<CellSummary as Summary>::Context,
-    ) -> std::cmp::Ordering {
-        Ord::cmp(self, &cursor_location.trailing_excerpt_id)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CellSummary {
-    trailing_cell_id: CellId,
-    trailing_excerpt_id: ExcerptId,
-}
-
-impl Summary for CellSummary {
-    type Context = ();
-
-    fn add_summary(&mut self, summary: &Self, cx: &Self::Context) {
-        self.trailing_cell_id.0 =
-            std::cmp::max(self.trailing_cell_id.0, summary.trailing_cell_id.0);
-        self.trailing_excerpt_id = ExcerptId::from_proto(std::cmp::max(
-            self.trailing_excerpt_id.to_proto(),
-            summary.trailing_excerpt_id.to_proto(),
-        ));
+        Ord::cmp(&(*self).into(), &cursor_location.num_cells_inclusive)
     }
 }
 
@@ -442,21 +453,66 @@ impl From<u64> for CellId {
     }
 }
 
-impl From<ExcerptId> for CellId {
-    fn from(excerpt_id: ExcerptId) -> Self {
-        CellId(excerpt_id.to_proto())
+impl From<CellId> for u64 {
+    fn from(id: CellId) -> Self {
+        id.0
     }
 }
 
-impl Into<u64> for CellId {
-    fn into(self) -> u64 {
-        self.0
+impl CellId {
+    pub(crate) fn pre_inc(&mut self) -> Self {
+        self.0 += 1;
+        *self
+    }
+
+    pub(crate) fn post_inc(&mut self) -> Self {
+        let id = *self;
+        self.0 += 1;
+        id
     }
 }
 
-impl Into<ExcerptId> for CellId {
-    fn into(self) -> ExcerptId {
-        ExcerptId::from_proto(self.into())
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, PartialOrd, Ord, Eq)]
+pub struct BlockId(u64);
+
+impl From<BlockId> for u64 {
+    fn from(id: BlockId) -> Self {
+        id.0
+    }
+}
+
+// This only works for now because all blocks are excerpts and all excerpts are blocks.
+// In the near future that may cease to be true, in which case we'll something like
+// a `BufferBlockId` (and the guarantee that each excerpt corresponds to a buffer).
+impl From<ExcerptId> for BlockId {
+    fn from(id: ExcerptId) -> Self {
+        BlockId::from(id.to_proto())
+    }
+}
+
+impl From<u64> for BlockId {
+    fn from(id: u64) -> Self {
+        BlockId(id)
+    }
+}
+
+impl<'a> Dimension<'a, CellSummary> for BlockId {
+    fn add_summary(&mut self, summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
+        *self = BlockId(self.0 + summary.num_blocks_inclusive)
+    }
+    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
+        BlockId(summary.num_blocks_inclusive)
+    }
+}
+
+impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for BlockId {
+    fn cmp(
+        &self,
+        cursor_location: &CellSummary,
+        cx: &<CellSummary as Summary>::Context,
+    ) -> std::cmp::Ordering {
+        Ord::cmp(&self.0, &cursor_location.num_blocks_inclusive)
     }
 }
 
@@ -506,8 +562,6 @@ pub enum StreamOutputTarget {
     #[serde(alias = "stderr")]
     Stderr,
 }
-
-pub enum JupyterServerEvent {}
 
 // `DisplayMapping`
 // For now, we have `Output` x `DisplayMapping` -> `enum Display { Buffer, impl IntoElement }`
@@ -665,7 +719,7 @@ impl File for PhonyFile {
     }
 }
 
-pub fn excerpt_range_over_buffer<M>(
+fn excerpt_range_over_buffer<M>(
     buffer: &Model<Buffer>,
     cx: &ModelContext<M>,
 ) -> ExcerptRange<usize> {

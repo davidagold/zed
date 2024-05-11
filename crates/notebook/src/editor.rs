@@ -1,22 +1,21 @@
 //! Jupyter support for Zed.
 
 use anyhow::anyhow;
-use editor::{items::entry_label_color, Editor, EditorEvent, ExcerptId, MAX_TAB_TITLE_LEN};
+use editor::{items::entry_label_color, Editor, EditorEvent, MAX_TAB_TITLE_LEN};
 use gpui::{
-    AnyView, AppContext, AsyncAppContext, EventEmitter, FocusHandle, FocusableView, Model,
-    ParentElement, Result, Subscription, View,
+    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    Subscription, View,
 };
-use language::Buffer;
 use log::{error, info};
 use project::{self, Project};
-use rpc::proto::Message;
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
 };
+use text::Bias;
 use ui::{
-    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
-    Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
+    SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
@@ -24,7 +23,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::CellId,
+    cell::{CellBuilder, CellId},
     do_in,
     kernel::{KernelCommand, KernelEvent},
     Notebook,
@@ -116,6 +115,26 @@ impl NotebookEditor {
                 Ok(response) => info!("{:#?}", response),
                 Err(err) => error!("{:#?}", err),
             };
+        });
+    }
+
+    fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
+        let Some((excerpt_id, _, _)) = self.editor.read(cx).active_excerpt(cx) else {
+            return ();
+        };
+
+        do_in!(|| {
+            let notebook = self.notebook.read(cx);
+            let mut current_cell_id = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?.id.get();
+            let new_cell_id = match bias {
+                Bias::Left => current_cell_id,
+                Bias::Right => current_cell_id.pre_inc(),
+            };
+            let cell = CellBuilder::new(new_cell_id.into()).build();
+            let editor_view = self.editor.clone();
+            self.notebook.update(cx, |notebook, cx| {
+                notebook.cells.insert_cell(cell, editor_view, cx)
+            });
         });
     }
 

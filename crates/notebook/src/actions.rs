@@ -7,5 +7,5 @@ pub enum ToggleNotebookView {
     Raw,
 }
 
-actions!(notebook, [RunCurrentCell]);
+actions!(notebook, [InsertCellAbove, InsertCellBelow, RunCurrentCell]);
 impl_actions!(notebook, [ToggleNotebookView]);

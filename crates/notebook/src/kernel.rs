@@ -82,7 +82,7 @@ impl JupyterKernelClient {
         cx: &ViewContext<NotebookEditor>,
     ) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {
         let code = cell.source.read(cx).text_snapshot().text();
-        self.send(KernelCommand::run(cell.id, code))
+        self.send(KernelCommand::run(cell.id.get(), code))
     }
 
     fn send(&self, cmd: KernelCommand) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {
