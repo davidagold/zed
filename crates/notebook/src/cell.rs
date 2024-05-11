@@ -17,6 +17,9 @@ use ui::Context;
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub id: CellId,
+    // The `msg_id` of the latest `execute_request` message sent to request the execution of the present cell
+    pub(crate) latest_execute_request_msg_id: Option<String>,
+
     pub cell_id: Option<String>, // `cell_id` is a notebook field
     _excerpt_id: std::cell::Cell<ExcerptId>,
     pub cell_type: CellType,
@@ -164,6 +167,7 @@ impl CellBuilder {
     pub fn build(self) -> Cell {
         Cell {
             id: CellId(self.id),
+            latest_execute_request_msg_id: None,
             _excerpt_id: std::cell::Cell::new(self.excerpt_id.take()),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
@@ -254,6 +258,63 @@ impl Cells {
         cursor.item()
     }
 
+    fn try_replace_with<F>(&mut self, cell_id: CellId, f: F) -> Result<Cell>
+    where
+        F: FnOnce(&Cell) -> Result<Cell>,
+    {
+        let Some(old_cell) = self.tree.get(&cell_id, &()) else {
+            let err = anyhow!("Cannot replace nonexistent cell with ID {:#?}", cell_id);
+            return Err(err);
+        };
+        let new_cell = f(old_cell)?;
+        if new_cell.id != old_cell.id {
+            return Err(anyhow!(
+                "New cell ID (`{:#?}`) must match old cell ID (`{:#?}`)",
+                new_cell.id,
+                old_cell.id
+            ));
+        };
+        self.tree.insert_or_replace(new_cell, &()).ok_or_else(|| {
+            anyhow!("Inserted new cell without replacing old, tree is likely corrupted")
+        })
+    }
+
+    fn insert_cell_after(&mut self, cell_id: CellId, cell: Cell) {
+        // TODO
+    }
+
+    pub(crate) fn update_cell_from_msg<C: Context>(
+        &self,
+        cell_id: &CellId,
+        msg: Message,
+        cx: &mut C,
+    ) -> Result<()>
+    where
+        C::Result<Model<Buffer>>: Into<Model<Buffer>>,
+    {
+        let Some(cell) = self.get_cell_by_id(cell_id) else {
+            return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
+        };
+        let output_buffer_handle = match cell.output_content.as_ref() {
+            Some(buffer_handle) => buffer_handle.clone(),
+            None => {
+                // TODO
+                cx.new_model(|cx| Buffer::local("", cx)).into()
+            }
+        };
+
+        // TODO: We need to check the parent message ID/execution count to ensure we only clear cell outputs
+        //       upon a new execution.
+        // cx.update_model(&output_buffer_handle, |buffer, cx| {
+        //;
+        //     // let excerpt_id = cell.
+
+        //     Ok(())
+        // });
+
+        Ok(())
+    }
+
     pub fn from_builders<'c>(
         mut builders: Vec<CellBuilder>,
         cx: &mut AsyncAppContext,
@@ -310,6 +371,14 @@ impl sum_tree::Item for Cell {
             trailing_cell_id: self.id,
             trailing_excerpt_id: self._excerpt_id.get().clone(),
         }
+    }
+}
+
+impl sum_tree::KeyedItem for Cell {
+    type Key = CellId;
+
+    fn key(&self) -> Self::Key {
+        self.id.clone()
     }
 }
 

@@ -45,7 +45,7 @@ impl Notebook {
         })
     }
 
-    async fn try_set_kernel_client(&mut self, cx: &mut AsyncAppContext) -> anyhow::Result<()> {
+    async fn try_init_kernel_client(&mut self, cx: &mut AsyncAppContext) -> anyhow::Result<()> {
         self.client_handle
             .replace(JupyterKernelClient::new_model(cx.clone()).await?);
         Ok(())
@@ -310,7 +310,7 @@ impl project::Item for Notebook {
                 return Err(err.into());
             };
             notebook
-                .try_set_kernel_client(&cx)
+                .try_init_kernel_client(&mut cx)
                 .await
                 .map_err(forward_err_with(|err: anyhow::Error| err.to_string()))?;
 

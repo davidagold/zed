@@ -38,8 +38,12 @@ pub struct NotebookEditor {
 }
 
 impl NotebookEditor {
-    fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let multi = notebook.read(cx).cells.multi.clone();
+    fn new(
+        project: Model<Project>,
+        notebook_handle: Model<Notebook>,
+        cx: &mut ViewContext<Self>,
+    ) -> Self {
+        let multi = notebook_handle.read(cx).cells.multi.clone();
 
         let editor = cx.new_view(|cx| {
             let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
@@ -67,7 +71,7 @@ impl NotebookEditor {
         }));
         subscriptions.push(
             cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
-                try_init_kernel_client(event.clone());
+                cx.emit(event.clone());
                 match event {
                     EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
                     _ => {
@@ -76,17 +80,19 @@ impl NotebookEditor {
                 }
             }),
         );
-        notebook.read(cx).client_handle.inspect(|client_handle| {
+        if let Some(client_handle) =
+            notebook_handle.read_with(cx, |notebook, cx| notebook.client_handle.clone())
+        {
             subscriptions.push(cx.subscribe(
-                client_handle,
+                &client_handle,
                 |this, client_handle, event: &KernelEvent, cx| {
                     //
                 },
             ));
-        });
+        };
 
         NotebookEditor {
-            notebook,
+            notebook: notebook_handle,
             editor,
             focus_handle,
             _subscriptions: subscriptions,
@@ -101,49 +107,16 @@ impl NotebookEditor {
         do_in!(|| {
             let notebook = self.notebook.read(cx);
             let current_cell = notebook.cells.get_by_excerpt_id(&excerpt_id)?;
-            match notebook.client_handle?.read(cx).run_cell(current_cell, cx) {
+            match notebook
+                .client_handle
+                .as_ref()?
+                .read(cx)
+                .run_cell(current_cell, cx)
+            {
                 Ok(response) => info!("{:#?}", response),
                 Err(err) => error!("{:#?}", err),
             };
         });
-    }
-
-    fn insert_after_cell_with_id(
-        &mut self,
-        cell_id: &CellId,
-        cx: &mut AsyncAppContext,
-    ) -> Model<Buffer> {
-        // cx.update(|cx| {
-        //     cx.
-        // })
-        // self.editor.update(, |editor, cx| {})
-    }
-
-    pub(crate) async fn update_cell_outputs<'a>(
-        &self,
-        cell_id: &CellId,
-        msg: Message,
-        cx: &mut ViewContext<'a, Self>,
-    ) -> Result<()> {
-        let Some(cell) = self.notebook.read(cx).cells.get_cell_by_id(cell_id) else {
-            return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
-        };
-
-        let output_buffer_handle = match cell.output_content {
-            Some(buffer_handle) => buffer_handle,
-            None => self.insert_after_cell_with_id(&cell.id, cx),
-        };
-        // TODO: We need to check the parent message ID/execution count to ensure we only clear cell outputs
-        //       upon a new execution.
-        cx.update_model(&output_buffer_handle, |buffer, cx| {
-            //
-        });
-        //     // let excerpt_id = cell.
-
-        //     Ok(())
-        // });
-
-        Ok(())
     }
 
     fn toggle_notebook_view(&mut self, cmd: &super::actions::ToggleNotebookView) {}

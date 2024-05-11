@@ -22,14 +22,14 @@ use crate::kwargs;
 use std::pin::Pin;
 
 #[pyclass]
-struct MessageHandler {
+struct ForwardMessage {
     tx: mpsc::Sender<Message>,
 }
 
-impl MessageHandler {
-    fn new() -> (MessageHandler, mpsc::Receiver<Message>) {
+impl ForwardMessage {
+    fn new() -> (ForwardMessage, mpsc::Receiver<Message>) {
         let (tx, rx) = mpsc::channel(1024);
-        (MessageHandler { tx }, rx)
+        (ForwardMessage { tx }, rx)
     }
 }
 
@@ -39,7 +39,7 @@ pub struct JupyterKernelClient {
 }
 
 #[pymethods]
-impl MessageHandler {
+impl ForwardMessage {
     #[pyo3(signature = (py_msg))]
     fn __call__<'py>(&self, py_msg: &Bound<'py, PyAny>) -> PyResult<()> {
         do_in!(|| info!("Got message {:#?}", py_msg.__str__()?));
@@ -130,7 +130,9 @@ impl JupyterKernelClient {
             Err(err) => return forward_with_print(err),
         };
 
-        let (io_pubsub_handler, mut conn_rx) = MessageHandler::new();
+        // TODO: Since we can match on the deserialized `MessageType` enum, there's no need
+        //       to set separate handlers for each channel.
+        let (io_pubsub_handler, mut conn_rx) = ForwardMessage::new();
         if let Err(err) = do_in!(|py| {
             let io_pubsub_msg_type = py
                 .import_bound("message")?
