@@ -1,17 +1,16 @@
-use crate::Notebook;
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
-use editor::{Editor, ExcerptId, ExcerptRange, MultiBuffer};
-use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, View, WeakModel};
+use editor::{ExcerptId, ExcerptRange, MultiBuffer};
+use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::{chain, Itertools};
 use language::{Buffer, Capability, File};
+use log::{error, warn};
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
-use std::borrow::Borrow;
 use std::cell::Cell as StdCell;
 use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
@@ -59,6 +58,11 @@ impl CellBuilder {
             id,
             ..CellBuilder::default()
         }
+    }
+
+    pub fn source(mut self, source: Model<Buffer>) -> Self {
+        self.source.replace(source);
+        self
     }
 
     pub(crate) fn process_map(
@@ -168,8 +172,8 @@ impl CellBuilder {
             id: CellId(self.id).into(),
             latest_execution_request_msg_id: None,
             cell_id: self.cell_id,
-            cell_type: self.cell_type.unwrap(),
-            metadata: self.metadata.unwrap(),
+            cell_type: self.cell_type.unwrap_or_default(),
+            metadata: self.metadata.unwrap_or_default(),
             source: self.source.unwrap(),
             execution_count: self.execution_count,
             outputs: self.outputs,
@@ -224,19 +228,27 @@ impl<'de> serde::Deserialize<'de> for CellType {
 }
 
 pub(crate) fn insert_as_excerpt_into_multibuffer(
-    buffer_handle: &Model<Buffer>,
-    prev_excerpt_id: ExcerptId,
+    // buffer_handle: &Model<Buffer>,
+    buffer_handles: impl IntoIterator<Item = Model<Buffer>>,
+    mut prev_excerpt_id: u64,
     multi: &mut MultiBuffer,
     cx: &mut ModelContext<MultiBuffer>,
 ) -> Result<()> {
-    let span = ExcerptRange {
-        context: std::ops::Range {
-            start: 0 as usize,
-            end: cx.read_model(buffer_handle, |buffer, cx| buffer.len() as usize),
-        },
-        primary: None,
-    };
-    multi.insert_excerpts_after(prev_excerpt_id, buffer_handle.clone(), vec![span], cx);
+    buffer_handles.into_iter().for_each(|handle| {
+        let span = ExcerptRange {
+            context: std::ops::Range {
+                start: 0 as usize,
+                end: cx.read_model(&handle, |buffer, cx| buffer.len() as usize),
+            },
+            primary: None,
+        };
+        multi.insert_excerpts_after(
+            ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
+            handle,
+            vec![span],
+            cx,
+        );
+    });
     Ok(())
 }
 
@@ -294,13 +306,33 @@ impl Cells {
         })
     }
 
-    pub(crate) fn insert(&mut self, cell: Cell, cx: &mut ModelContext<Notebook>) {
+    pub(crate) fn insert<C: Context>(
+        &mut self,
+        cells: Vec<Cell>,
+        cx: &mut C, // cx: &mut ModelContext<Notebook>,
+    ) -> Result<()> {
+        if cells.is_empty() {
+            return Err(anyhow!("No cells to insert"));
+        };
+        let id_first_to_insert = cells.first().unwrap().id.get();
+        let id_last_to_insert = cells.last().unwrap().id.get();
+
+        cells
+            .iter()
+            .skip(1)
+            .try_fold(id_first_to_insert.clone(), |prev_cell_id, cell| {
+                if prev_cell_id.clone().pre_inc() != cell.id.get() {
+                    return Err(anyhow!("Cells to insert must have contiguous IDs"));
+                };
+                anyhow::Ok(cell.id.get())
+            })?;
+
         let mut cursor = self.tree.cursor::<CellId>();
-        let keep_as_is = cursor.slice(&cell.id.get(), Bias::Left, &());
-        let mut next_cell_id = cell.id.get().pre_inc();
+        let keep_as_is = cursor.slice(&id_first_to_insert, Bias::Left, &());
+        let mut next_cell_id = id_last_to_insert.clone().pre_inc();
         let iter_cells = chain!(
             keep_as_is.iter(),
-            vec![&cell].into_iter(),
+            cells.iter(),
             cursor.map(|cell| {
                 cell.id.set(next_cell_id.post_inc().clone().into());
                 cell
@@ -310,12 +342,26 @@ impl Cells {
 
         let mut cursor = self.tree.cursor::<CellId>();
         let num_excerpts_preceding: u64 = cursor
-            .summary::<CellId, BlockId>(&cell.id.get(), Bias::Left, &())
+            .summary::<CellId, BlockId>(&id_first_to_insert, Bias::Left, &())
             .into();
         let prev_excerpt_id = ExcerptId::from_proto(num_excerpts_preceding);
+        let buffers_to_insert = cells
+            .iter()
+            .flat_map(|cell| vec![Some(cell.source.clone()), cell.output_content.clone()])
+            .filter_map(|maybe_handle| maybe_handle);
+
         cx.update_model(&self.multi, |multi, cx| {
-            insert_as_excerpt_into_multibuffer(&cell.source, prev_excerpt_id, multi, cx);
+            if let Err(err) = insert_as_excerpt_into_multibuffer(
+                buffers_to_insert,
+                prev_excerpt_id.to_proto(),
+                multi,
+                cx,
+            ) {
+                error!("{:#?}", err)
+            };
         });
+
+        Ok(())
     }
 
     pub(crate) fn update_cell_from_msg<C: Context>(
@@ -353,42 +399,14 @@ impl Cells {
 
     // TODO: We no longer need excerpt ID to live in cell so this is just kind of confusing being down here
     pub fn from_builders<'c>(
-        mut builders: Vec<CellBuilder>,
+        builders: Vec<CellBuilder>,
         cx: &mut AsyncAppContext,
     ) -> Result<Cells> {
-        let multi = cx.new_model(|cx| {
-            let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-
-            let mut prev_excerpt_id = ExcerptId::min().to_proto();
-            for builder in builders.iter_mut() {
-                do_in!(|| {
-                    let source = builder.source.as_ref()?.clone();
-                    insert_as_excerpt_into_multibuffer(
-                        &source,
-                        ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
-                        &mut multi,
-                        cx,
-                    )
-                    .ok();
-                    if let Some(output_buffer) = &builder.output_content {
-                        insert_as_excerpt_into_multibuffer(
-                            output_buffer,
-                            ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
-                            &mut multi,
-                            cx,
-                        )
-                        .ok();
-                    }
-                });
-            }
-
-            multi
-        })?;
-
-        Ok(Cells {
-            tree: SumTree::<Cell>::from_iter(builders.into_iter().map(|b| b.build()), &()),
-            multi,
-        })
+        let tree = SumTree::<Cell>::new();
+        let multi = cx.new_model(|_cx| MultiBuffer::new(0, Capability::ReadWrite))?;
+        let mut this = Cells { tree, multi };
+        let cells_to_insert = builders.into_iter().map(|b| b.build()).collect_vec();
+        this.insert(cells_to_insert, cx).map(|_| this)
     }
 }
 

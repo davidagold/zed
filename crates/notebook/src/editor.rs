@@ -1,11 +1,11 @@
 //! Jupyter support for Zed.
 
-use anyhow::anyhow;
 use editor::{items::entry_label_color, Editor, EditorEvent, MAX_TAB_TITLE_LEN};
 use gpui::{
     AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
+use language::Buffer;
 use log::{error, info};
 use project::{self, Project};
 use std::{
@@ -14,18 +14,18 @@ use std::{
 };
 use text::Bias;
 use ui::{
-    div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
-    SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
+    Render, SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
-    actions,
-    cell::{CellBuilder, CellId},
+    actions::{self},
+    cell::CellBuilder,
     do_in,
-    kernel::{KernelCommand, KernelEvent},
+    kernel::KernelEvent,
     Notebook,
 };
 
@@ -118,6 +118,21 @@ impl NotebookEditor {
         });
     }
 
+    fn insert_cell_above(
+        &mut self,
+        _cmd: &actions::InsertCellAbove,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
+        self.insert_cell(Bias::Left, cx)
+    }
+    fn insert_cell_below(
+        &mut self,
+        _cmd: &actions::InsertCellBelow,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
+        self.insert_cell(Bias::Right, cx)
+    }
+
     fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
         let Some((excerpt_id, _, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
@@ -130,9 +145,11 @@ impl NotebookEditor {
                 Bias::Left => current_cell_id,
                 Bias::Right => current_cell_id.pre_inc(),
             };
-            let cell = CellBuilder::new(new_cell_id.into()).build();
+            let source = cx.new_model(|cx| Buffer::local("", cx));
+            let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
             self.notebook
-                .update(cx, |notebook, cx| notebook.cells.insert(cell, cx));
+                .update(cx, |notebook, cx| notebook.cells.insert(vec![cell], cx))
+                .ok()?;
         });
     }
 
@@ -246,6 +263,8 @@ impl Render for NotebookEditor {
             .size_full()
             .child(self.editor.clone())
             .on_action(cx.listener(NotebookEditor::run_current_cell))
+            .on_action(cx.listener(NotebookEditor::insert_cell_above))
+            .on_action(cx.listener(NotebookEditor::insert_cell_below))
     }
 }
 
