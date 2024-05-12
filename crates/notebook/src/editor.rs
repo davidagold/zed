@@ -131,10 +131,8 @@ impl NotebookEditor {
                 Bias::Right => current_cell_id.pre_inc(),
             };
             let cell = CellBuilder::new(new_cell_id.into()).build();
-            let editor_view = self.editor.clone();
-            self.notebook.update(cx, |notebook, cx| {
-                notebook.cells.insert_cell(cell, editor_view, cx)
-            });
+            self.notebook
+                .update(cx, |notebook, cx| notebook.cells.insert(cell, cx));
         });
     }
 

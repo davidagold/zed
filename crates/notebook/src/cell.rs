@@ -17,14 +17,16 @@ use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
 use text::Bias;
 use ui::Context;
+use util::post_inc;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub id: StdCell<CellId>,
     // The `msg_id` of the latest `execute_request` message sent to request the execution of the present cell
-    pub(crate) latest_execute_request_msg_id: Option<String>,
+    pub(crate) latest_execution_request_msg_id: Option<String>,
 
-    pub cell_id: Option<String>, // `cell_id` is a notebook field
+    // `cell_id` is a notebook field, whereas `cell.id` is the `KeyedItem` associated type  for a `SumTree<Cell>`
+    pub cell_id: Option<String>,
     pub cell_type: CellType,
     pub metadata: HashMap<String, serde_json::Value>,
     pub source: Model<Buffer>,
@@ -164,7 +166,7 @@ impl CellBuilder {
     pub fn build(self) -> Cell {
         Cell {
             id: CellId(self.id).into(),
-            latest_execute_request_msg_id: None,
+            latest_execution_request_msg_id: None,
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap(),
             metadata: self.metadata.unwrap(),
@@ -221,6 +223,23 @@ impl<'de> serde::Deserialize<'de> for CellType {
     }
 }
 
+pub(crate) fn insert_as_excerpt_into_multibuffer(
+    buffer_handle: &Model<Buffer>,
+    prev_excerpt_id: ExcerptId,
+    multi: &mut MultiBuffer,
+    cx: &mut ModelContext<MultiBuffer>,
+) -> Result<()> {
+    let span = ExcerptRange {
+        context: std::ops::Range {
+            start: 0 as usize,
+            end: cx.read_model(buffer_handle, |buffer, cx| buffer.len() as usize),
+        },
+        primary: None,
+    };
+    multi.insert_excerpts_after(prev_excerpt_id, buffer_handle.clone(), vec![span], cx);
+    Ok(())
+}
+
 pub struct Cells {
     pub(crate) tree: SumTree<Cell>,
     pub(crate) multi: Model<MultiBuffer>,
@@ -275,12 +294,7 @@ impl Cells {
         })
     }
 
-    pub(crate) fn insert_cell(
-        &mut self,
-        cell: Cell,
-        editor_view: View<Editor>,
-        cx: &mut ModelContext<Notebook>,
-    ) {
+    pub(crate) fn insert(&mut self, cell: Cell, cx: &mut ModelContext<Notebook>) {
         let mut cursor = self.tree.cursor::<CellId>();
         let keep_as_is = cursor.slice(&cell.id.get(), Bias::Left, &());
         let mut next_cell_id = cell.id.get().pre_inc();
@@ -298,14 +312,9 @@ impl Cells {
         let num_excerpts_preceding: u64 = cursor
             .summary::<CellId, BlockId>(&cell.id.get(), Bias::Left, &())
             .into();
-        let range = excerpt_range_over_buffer(&cell.source, cx);
-        self.multi.update(cx, |multi, cx| {
-            multi.insert_excerpts_after(
-                ExcerptId::from_proto(num_excerpts_preceding),
-                cell.source,
-                vec![range],
-                cx,
-            );
+        let prev_excerpt_id = ExcerptId::from_proto(num_excerpts_preceding);
+        cx.update_model(&self.multi, |multi, cx| {
+            insert_as_excerpt_into_multibuffer(&cell.source, prev_excerpt_id, multi, cx);
         });
     }
 
@@ -321,6 +330,7 @@ impl Cells {
         let Some(cell) = self.get_cell_by_id(cell_id) else {
             return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
         };
+
         let output_buffer_handle = match cell.output_content.as_ref() {
             Some(buffer_handle) => buffer_handle.clone(),
             None => {
@@ -346,35 +356,30 @@ impl Cells {
         mut builders: Vec<CellBuilder>,
         cx: &mut AsyncAppContext,
     ) -> Result<Cells> {
-        let multi = cx.new_model(|model_cx| {
+        let multi = cx.new_model(|cx| {
             let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
 
-            let mut prev_excerpt_id = ExcerptId::min();
+            let mut prev_excerpt_id = ExcerptId::min().to_proto();
             for builder in builders.iter_mut() {
-                let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
                 do_in!(|| {
                     let source = builder.source.as_ref()?.clone();
-                    let range = excerpt_range_over_buffer(&source, model_cx);
-                    multi.insert_excerpts_with_ids_after(
-                        prev_excerpt_id,
-                        source,
-                        vec![(excerpt_id, range)],
-                        model_cx,
-                    );
-                    prev_excerpt_id = excerpt_id;
+                    insert_as_excerpt_into_multibuffer(
+                        &source,
+                        ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
+                        &mut multi,
+                        cx,
+                    )
+                    .ok();
+                    if let Some(output_buffer) = &builder.output_content {
+                        insert_as_excerpt_into_multibuffer(
+                            output_buffer,
+                            ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
+                            &mut multi,
+                            cx,
+                        )
+                        .ok();
+                    }
                 });
-
-                if let Some(output_buffer) = &builder.output_content {
-                    let excerpt_id = ExcerptId::from_proto(prev_excerpt_id.to_proto() + 1);
-                    let range = excerpt_range_over_buffer(&output_buffer, model_cx);
-                    multi.insert_excerpts_with_ids_after(
-                        prev_excerpt_id,
-                        output_buffer.clone(),
-                        vec![(excerpt_id, range)],
-                        model_cx,
-                    );
-                    prev_excerpt_id = excerpt_id;
-                }
             }
 
             multi
@@ -563,7 +568,7 @@ pub enum StreamOutputTarget {
     Stderr,
 }
 
-// `DisplayMapping`
+// `DisplayMapping` (`ViewMatter` ... or `IntoView<Of = V>)
 // For now, we have `Output` x `DisplayMapping` -> `enum Display { Buffer, impl IntoElement }`
 // But in general, there's no reason to treat `Buffer` specially.
 // We do so currently only because we rely ~100% on the existing editor implementation.
@@ -719,19 +724,7 @@ impl File for PhonyFile {
     }
 }
 
-fn excerpt_range_over_buffer<M>(
-    buffer: &Model<Buffer>,
-    cx: &ModelContext<M>,
-) -> ExcerptRange<usize> {
-    ExcerptRange {
-        context: std::ops::Range {
-            start: 0 as usize,
-            end: buffer.read(cx).len() as _,
-        },
-        primary: None,
-    }
-}
-
+// TODO: Just pass the cell
 pub(crate) fn title_for_cell_excerpt(
     idx: u64,
     cell_id: Option<&String>,
