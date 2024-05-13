@@ -6,7 +6,7 @@ use gpui::{
     Subscription, View,
 };
 use language::Buffer;
-use log::{error, info};
+use log::{error, info, warn};
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
@@ -88,6 +88,7 @@ impl NotebookEditor {
             subscriptions.push(cx.subscribe(
                 &client_handle,
                 |this, client_handle, event: &KernelEvent, cx| {
+                    warn!("{:#?}", event);
                     //
                 },
             ));

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use collections::HashMap;
 use futures::{select, Future, FutureExt};
 use gpui::{AsyncAppContext, EventEmitter, Flatten, Model, Task};
 use log::{error, info};
@@ -145,6 +146,7 @@ impl JupyterKernelClient {
         }
 
         info!("[JupyterKernelClient task] Starting inner loop");
+        let mut cell_ids_by_msg_id = HashMap::<String, CellId>::default();
         loop {
             cx.background_executor()
                 .timer(Duration::from_millis(5))
@@ -157,9 +159,15 @@ impl JupyterKernelClient {
                 maybe_msg = conn_rx.recv().fuse() => {
                     match maybe_msg {
                         Some(msg) => {
-                            if let Err(err) = client_handle.update(&mut cx, |_client, cx| cx.emit(KernelEvent::ReceivedKernelMessage(msg))){
-                                error!("Received message but failed to emit event: {:#?}", err);
-                            }
+                            do_in!(|| {
+                                let cell_id = *cell_ids_by_msg_id.get(&msg.parent_header.msg_id)?;
+                                if let Err(err) = client_handle.update(
+                                    &mut cx,
+                                    |_client, cx| cx.emit(KernelEvent::ReceivedKernelMessage { msg, cell_id })
+                                ){
+                                    error!("Received message but failed to emit event: {:#?}", err);
+                                };
+                            });
                         },
                         None => continue
                     }
@@ -175,6 +183,13 @@ impl JupyterKernelClient {
                                 match conn.call_method1(py, "execute_code", (code,)) {
                                     Ok(response) => {
                                         do_in!(|| info!("Message ID: {:#?}", response.__str__()?));
+                                        if let Err(err) = do_in!(|py| -> PyResult<_> {
+                                            let msg_id = response.extract::<String>(py)?;
+                                            cell_ids_by_msg_id.insert(msg_id, cell_id);
+                                            Ok(())
+                                        }){
+                                            error!("Failed to store message ID for execution request for cell with ID {:#?}: {:#?}", cell_id, err);
+                                        };
                                     }
                                     Err(err) => err.print(py),
                                 }
@@ -221,17 +236,10 @@ impl KernelCommand {
     }
 }
 
+#[derive(Debug)]
 pub enum KernelEvent {
-    ReceivedKernelMessage(jupyter::message::Message),
-}
-
-// TODO: Decide whether to include these or save them for later
-struct KernelId(String);
-enum KernelState {
-    Stopped,
-    Starting,
-    Ready,
-    Executing,
-    Responding,
-    Terminating,
+    ReceivedKernelMessage {
+        msg: jupyter::message::Message,
+        cell_id: CellId,
+    },
 }
