@@ -69,12 +69,15 @@ impl NotebookEditor {
             log::info!("Event: {:#?}", event);
         }));
         subscriptions.push(
-            cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
+            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
                 cx.emit(event.clone());
                 match event {
                     EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                    EditorEvent::TitleChanged => {
+                        cx.notify();
+                    }
                     _ => {
-                        log::info!("Event: {:#?}", event);
+                        // log::info!("Event: {:#?}", event);
                     }
                 }
             }),
@@ -102,6 +105,8 @@ impl NotebookEditor {
         let Some((excerpt_id, _, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
+
+        // self.editor.update(cx, f)
 
         do_in!(|| {
             let notebook = self.notebook.read(cx);
@@ -140,20 +145,20 @@ impl NotebookEditor {
         };
 
         do_in!(|| {
-            let notebook = self.notebook.read(cx);
-            let mut current_cell_id = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?.id.get();
+            let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
+                let current_cell = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?;
+                Some(current_cell.id.get().clone())
+            })?;
             let new_cell_id = match bias {
                 Bias::Left => current_cell_id,
                 Bias::Right => current_cell_id.pre_inc(),
             };
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
-            if let Err(err) = self
-                .notebook
-                .update(cx, |notebook, cx| notebook.cells.insert(vec![cell], cx))
-            {
-                error!("{:#?}", err)
-            }
+            self.notebook
+                .update(cx, |notebook, cx| notebook.cells.insert(vec![cell], cx));
+
+            cx.refresh()
         });
     }
 

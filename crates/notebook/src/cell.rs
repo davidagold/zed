@@ -61,6 +61,13 @@ impl Cell {
             })
         );
     }
+
+    fn increment_id<C: Context>(self, cx: &mut C) -> Self {
+        let incremented_id = self.id.get().pre_inc();
+        self.id.set(incremented_id);
+        self.update_titles(cx);
+        self
+    }
 }
 
 #[derive(Default)]
@@ -263,6 +270,7 @@ pub(crate) fn insert_as_excerpts_into_multibuffer(
     multi: &mut MultiBuffer,
     cx: &mut ModelContext<MultiBuffer>,
 ) -> Result<()> {
+    let mut id_last_excerpt_added: Option<ExcerptId> = None;
     buffer_handles.into_iter().for_each(|handle| {
         let span = ExcerptRange {
             context: std::ops::Range {
@@ -271,12 +279,25 @@ pub(crate) fn insert_as_excerpts_into_multibuffer(
             },
             primary: None,
         };
-        multi.insert_excerpts_after(
-            ExcerptId::from_proto(post_inc(&mut prev_excerpt_id)),
-            handle,
-            vec![span],
-            cx,
-        );
+        // let _prev_excerpt_id = ExcerptId::from_proto(post_inc(&mut prev_excerpt_id));
+        // let this_excerpt_id = ExcerptId::from_proto(prev_excerpt_id);
+        // warn!(
+        //     "Inserting excerpt ID {:#?} after {:#?}",
+        //     this_excerpt_id, _prev_excerpt_id
+        // );
+        do_in!(|| {
+            id_last_excerpt_added.replace(
+                *multi
+                    .insert_excerpts_after(
+                        id_last_excerpt_added.unwrap_or(ExcerptId::from_proto(prev_excerpt_id)),
+                        handle,
+                        // vec![(this_excerpt_id, span)],
+                        vec![span],
+                        cx,
+                    )
+                    .last()?,
+            );
+        });
     });
     Ok(())
 }
@@ -284,6 +305,7 @@ pub(crate) fn insert_as_excerpts_into_multibuffer(
 pub struct Cells {
     pub(crate) tree: SumTree<Cell>,
     pub(crate) multi: Model<MultiBuffer>,
+    cell_ids: HashMap<CellId, Vec<ExcerptId>>,
 }
 
 impl Cells {
@@ -339,48 +361,81 @@ impl Cells {
         &mut self,
         cells: Vec<Cell>,
         cx: &mut C, // cx: &mut ModelContext<Notebook>,
-    ) -> Result<()> {
-        if cells.is_empty() {
-            return Err(anyhow!("No cells to insert"));
-        };
-        let id_first_to_insert = cells.first().unwrap().id.get();
-        let id_last_to_insert = cells.last().unwrap().id.get();
+    ) -> C::Result<Result<()>> {
+        self.multi.update(cx, |multi, cx| {
+            if cells.is_empty() {
+                return Err(anyhow!("No cells to insert"));
+            };
+            for cell in cells.iter() {
+                cell.update_titles(cx);
+            }
+            let id_first_to_insert = cells.first().unwrap().id.get();
 
-        cells
-            .iter()
-            .skip(1)
-            .try_fold(id_first_to_insert.clone(), |prev_cell_id, cell| {
-                if prev_cell_id.clone().pre_inc() != cell.id.get() {
-                    return Err(anyhow!("Cells to insert must have contiguous IDs"));
-                };
-                anyhow::Ok(cell.id.get())
-            })?;
+            let mut cursor = self.tree.cursor::<CellId>();
+            let keep_as_is = cursor.slice(&id_first_to_insert, Bias::Left, &());
+            let prev_cell = cursor.prev_item().ok_or_else(|| anyhow!("Nope"));
+            warn!("prev_cell: {:#?}", prev_cell);
 
-        let mut cursor = self.tree.cursor::<CellId>();
-        let keep_as_is = cursor.slice(&id_first_to_insert, Bias::Left, &());
-        let mut next_cell_id = id_last_to_insert.clone().pre_inc();
-        let iter_cells = chain!(
-            keep_as_is.iter(),
-            cells.iter(),
-            cursor.map(|cell| {
-                cell.id.set(next_cell_id.post_inc().clone().into());
-                // cell.update_titles(cx);
-                cell
-            }),
-        );
-        self.tree = SumTree::<Cell>::from_iter(iter_cells.map(|cell| cell.clone()), &());
+            let prev_excerpt_id = prev_cell
+                .and_then(|cell| {
+                    let excerpt_id = multi
+                        .excerpts_for_buffer(
+                            cell.output_content.as_ref().unwrap_or(&cell.source),
+                            cx,
+                        )
+                        .last()
+                        .ok_or_else(|| anyhow!("Failed to obtain next excerpt ID"))
+                        .inspect_err(|err| error!("{:#?}", err))?
+                        .0;
+                    Ok(excerpt_id)
+                })
+                .unwrap_or(ExcerptId::min());
 
-        let mut cursor = self.tree.cursor::<CellId>();
-        let num_excerpts_preceding: u64 = cursor
-            .summary::<CellId, BlockId>(&id_first_to_insert, Bias::Left, &())
-            .into();
-        let prev_excerpt_id = ExcerptId::from_proto(num_excerpts_preceding);
-        let buffers_to_insert = cells
-            .iter()
-            .flat_map(|cell| vec![Some(cell.source.clone()), cell.output_content.clone()])
-            .filter_map(|maybe_handle| maybe_handle);
+            warn!("prev_excerpt_id: {:#?}", prev_excerpt_id);
+            warn!("next_excerpt_id: {:#?}", cursor.item());
 
-        cx.update_model(&self.multi, |multi, cx| {
+            let mut ids_excerpts_to_remove = Vec::<ExcerptId>::new();
+            let mut cells_to_shift = Vec::<Cell>::new();
+            while let Some(cell) = cursor.item() {
+                cells_to_shift.push(cell.clone().increment_id(cx));
+                ids_excerpts_to_remove.extend(
+                    multi
+                        .excerpts_for_buffer(&cell.source, cx)
+                        .into_iter()
+                        .map(|(id, _)| id),
+                );
+
+                do_in!(|| {
+                    ids_excerpts_to_remove.extend(
+                        multi
+                            .excerpts_for_buffer(cell.output_content.as_ref()?, cx)
+                            .into_iter()
+                            .map(|(id, _)| id),
+                    )
+                });
+                cursor.next(&());
+            }
+
+            warn!("ids_excerpts_to_remove: {:#?}", ids_excerpts_to_remove);
+
+            multi.remove_excerpts(ids_excerpts_to_remove, cx);
+            drop(cursor);
+
+            // info!("Excerpt IDs: {:#?}", multi.excerpt_ids());
+            // let ids_snapshot = multi
+            //     .snapshot(cx)
+            //     .excerpts()
+            //     .into_iter()
+            //     .map(|(id, _, _)| id)
+            //     .collect_vec();
+            // info!("Excerpt IDs from snapshot: {:#?}", ids_snapshot);
+
+            let buffers_to_insert = cells
+                .iter()
+                .chain(cells_to_shift.iter())
+                .flat_map(|cell| vec![Some(cell.source.clone()), cell.output_content.clone()])
+                .filter_map(|maybe_handle| maybe_handle);
+
             if let Err(err) = insert_as_excerpts_into_multibuffer(
                 buffers_to_insert,
                 prev_excerpt_id.to_proto(),
@@ -389,12 +444,16 @@ impl Cells {
             ) {
                 error!("{:#?}", err)
             };
-            for cell in self.tree.iter() {
-                cell.update_titles(cx);
-            }
-        });
 
-        Ok(())
+            warn!("They should be inserted???!");
+
+            let iter_cells = chain!(keep_as_is.iter(), cells.iter(), cells_to_shift.iter());
+            self.tree = SumTree::<Cell>::from_iter(iter_cells.map(|cell| cell.clone()), &());
+
+            Ok(())
+        })
+
+        // })
     }
 
     pub(crate) fn update_cell_from_msg<C: Context>(
@@ -437,7 +496,12 @@ impl Cells {
     ) -> Result<Cells> {
         let tree = SumTree::<Cell>::new();
         let multi = cx.new_model(|_cx| MultiBuffer::new(0, Capability::ReadWrite))?;
-        let mut this = Cells { tree, multi };
+        let cell_ids = HashMap::<CellId, Vec<ExcerptId>>::default();
+        let mut this = Cells {
+            tree,
+            multi,
+            cell_ids,
+        };
         let cells_to_insert = builders.into_iter().map(|b| b.build()).collect_vec();
         this.insert(cells_to_insert, cx).map(|_| this)
     }
