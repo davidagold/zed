@@ -9,18 +9,18 @@ use serde_json::Value;
 
 use crate::cell::{MimeData, StreamOutputTarget};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Message {
     pub(crate) header: MessageHeader,
     pub(crate) msg_id: String,
     pub(crate) msg_type: MessageType,
     pub(crate) parent_header: MessageHeader,
     pub(crate) metadata: HashMap<String, Value>,
-    pub(crate) content: MessageContent,
+    pub(crate) content: HashMap<String, Value>,
     pub(crate) buffers: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct MessageHeader {
     pub(crate) msg_id: String,
     pub(crate) session: String,
@@ -30,7 +30,7 @@ pub struct MessageHeader {
     pub(crate) version: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum MessageType {
     Shell(ShellMessageType),
     IoPubSub(IoPubSubMessageType),
@@ -84,7 +84,7 @@ impl<'de> Deserialize<'de> for MessageType {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum ShellMessageType {
     #[serde(rename = "execute_request")]
     ExecuteRequest,
@@ -120,7 +120,7 @@ pub enum ShellMessageType {
     KernelInfoReply,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum IoPubSubMessageType {
     #[serde(rename = "stream")]
     Stream,
@@ -143,8 +143,7 @@ pub enum IoPubSubMessageType {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MessageContent {
+pub enum IoPubSubMessageContent {
     #[serde(alias = "stream")]
     Stream {
         name: StreamOutputTarget,
