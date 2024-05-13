@@ -102,15 +102,14 @@ impl NotebookEditor {
     }
 
     fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) -> () {
-        let Some((excerpt_id, _, _)) = self.editor.read(cx).active_excerpt(cx) else {
+        let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
-
         // self.editor.update(cx, f)
 
         do_in!(|| {
             let notebook = self.notebook.read(cx);
-            let current_cell = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?;
+            let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
             info!("{:#?}", current_cell.id.get());
             match notebook
                 .client_handle
@@ -131,6 +130,7 @@ impl NotebookEditor {
     ) -> () {
         self.insert_cell(Bias::Left, cx)
     }
+
     fn insert_cell_below(
         &mut self,
         _cmd: &actions::InsertCellBelow,
@@ -140,13 +140,13 @@ impl NotebookEditor {
     }
 
     fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
-        let Some((excerpt_id, _, _)) = self.editor.read(cx).active_excerpt(cx) else {
+        let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
 
         do_in!(|| {
             let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
-                let current_cell = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?;
+                let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
                 Some(current_cell.id.get().clone())
             })?;
             let new_cell_id = match bias {
