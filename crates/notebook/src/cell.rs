@@ -5,7 +5,7 @@ use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::{chain, Itertools};
 use language::{Buffer, Capability, File};
-use log::{error, warn};
+use log::{error, info, warn};
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
@@ -32,6 +32,35 @@ pub struct Cell {
     pub execution_count: Option<usize>,
     pub outputs: Option<Vec<IpynbCodeOutput>>,
     pub output_content: Option<Model<Buffer>>,
+}
+
+impl Cell {
+    pub(crate) fn update_titles<C: Context>(&self, cx: &mut C) {
+        cx.update_model(&self.source, |buffer, cx| {
+            let title = title_for_cell_excerpt(
+                self.id.get().into(),
+                self.cell_id.as_ref(),
+                &self.cell_type,
+                false,
+            );
+            let title_path = title.path().clone();
+            buffer.file_updated(Arc::new(title), cx);
+            info!("Title updated to {:#?}", title_path);
+        });
+        do_in!(
+            || cx.update_model(self.output_content.as_ref()?, |buffer, cx| {
+                let title = title_for_cell_excerpt(
+                    self.id.get().into(),
+                    self.cell_id.as_ref(),
+                    &self.cell_type,
+                    true,
+                );
+                let title_path = title.path().clone();
+                buffer.file_updated(Arc::new(title), cx);
+                info!("Title updated to {:#?}", title_path);
+            })
+        );
+    }
 }
 
 #[derive(Default)]
@@ -227,7 +256,7 @@ impl<'de> serde::Deserialize<'de> for CellType {
     }
 }
 
-pub(crate) fn insert_as_excerpt_into_multibuffer(
+pub(crate) fn insert_as_excerpts_into_multibuffer(
     // buffer_handle: &Model<Buffer>,
     buffer_handles: impl IntoIterator<Item = Model<Buffer>>,
     mut prev_excerpt_id: u64,
@@ -335,6 +364,7 @@ impl Cells {
             cells.iter(),
             cursor.map(|cell| {
                 cell.id.set(next_cell_id.post_inc().clone().into());
+                // cell.update_titles(cx);
                 cell
             }),
         );
@@ -351,7 +381,7 @@ impl Cells {
             .filter_map(|maybe_handle| maybe_handle);
 
         cx.update_model(&self.multi, |multi, cx| {
-            if let Err(err) = insert_as_excerpt_into_multibuffer(
+            if let Err(err) = insert_as_excerpts_into_multibuffer(
                 buffers_to_insert,
                 prev_excerpt_id.to_proto(),
                 multi,
@@ -359,6 +389,9 @@ impl Cells {
             ) {
                 error!("{:#?}", err)
             };
+            for cell in self.tree.iter() {
+                cell.update_titles(cx);
+            }
         });
 
         Ok(())

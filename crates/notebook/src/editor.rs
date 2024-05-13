@@ -106,6 +106,7 @@ impl NotebookEditor {
         do_in!(|| {
             let notebook = self.notebook.read(cx);
             let current_cell = notebook.cells.get_cell_by_excerpt_id(&excerpt_id)?;
+            info!("{:#?}", current_cell.id.get());
             match notebook
                 .client_handle
                 .as_ref()?
@@ -147,9 +148,12 @@ impl NotebookEditor {
             };
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
-            self.notebook
+            if let Err(err) = self
+                .notebook
                 .update(cx, |notebook, cx| notebook.cells.insert(vec![cell], cx))
-                .ok()?;
+            {
+                error!("{:#?}", err)
+            }
         });
     }
 
@@ -161,7 +165,7 @@ const NOTEBOOK_KIND: &'static str = "NotebookEditor";
 impl workspace::item::Item for NotebookEditor {
     type Event = EditorEvent;
 
-    fn to_item_events(event: &Self::Event, f: impl FnMut(ItemEvent)) {
+    fn to_item_events(event: &EditorEvent, f: impl FnMut(ItemEvent)) {
         Editor::to_item_events(event, f)
     }
 
