@@ -9,11 +9,12 @@ use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
 use crate::jupyter::python::TryAsStr;
 use anyhow::{anyhow, Result};
-use cell::CellBuilder;
+use cell::{Cell, CellBuilder, CellId};
 use collections::HashMap;
 use gpui::{AsyncAppContext, Context, Model, WeakModel};
+use itertools::Itertools;
 use kernel::JupyterKernelClient;
-use language::Language;
+use language::{Buffer, Language};
 use log::{error, info};
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
@@ -49,55 +50,57 @@ impl Notebook {
         Ok(())
     }
 
-    async fn try_set_source_languages(
+    pub(crate) async fn try_get_notebook_language(
         &mut self,
         project: &WeakModel<Project>,
         cx: &mut AsyncAppContext,
     ) -> anyhow::Result<()> {
-        let Some(kernel_spec) = (&self.metadata).as_ref().and_then(|metadata| {
-            log::info!("NotebookBuilder.metadata: {:#?}", metadata);
-            serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
-        }) else {
-            return Err(anyhow!("No kernel spec"));
-        };
+        if self.language.is_none() {
+            let Some(kernel_spec) = (&self.metadata).as_ref().and_then(|metadata| {
+                log::info!("NotebookBuilder.metadata: {:#?}", metadata);
+                serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
+            }) else {
+                return Err(anyhow!("No kernel spec"));
+            };
 
-        log::info!("kernel_spec: {:#?}", kernel_spec);
-
-        let cloned_project = project.clone();
-        let language = cx
-            .spawn(|cx| async move {
-                match kernel_spec.language.as_str() {
-                    "python" => cloned_project.read_with(&cx, |project, cx| {
-                        let languages = project.languages();
-                        languages.language_for_name("Python")
-                    }),
-                    _ => Err(anyhow!("Failed to get language")),
-                }?
-                .await
-            })
-            .await;
-
-        self.language = language.ok().inspect(|lang| {
-            match do_in!(|| -> anyhow::Result<()> {
-                let handle = &project
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("Cannot upgrade project"))?;
-
-                cx.update_model(handle, |project, cx| {
-                    for cell in self.cells.iter() {
-                        project.set_language_for_buffer(&cell.source, lang.clone(), cx)
-                    }
+            let cloned_project = project.clone();
+            let language = cx
+                .spawn(|cx| async move {
+                    match kernel_spec.language.as_str() {
+                        "python" => cloned_project.read_with(&cx, |project, cx| {
+                            let languages = project.languages();
+                            languages.language_for_name("Python")
+                        }),
+                        _ => Err(anyhow!("Failed to get language")),
+                    }?
+                    .await
                 })
-            }) {
-                Ok(_) => log::info!("Successfully set languages for all source buffers"),
-                Err(err) => error!(
-                    "Failed to set language for at least one source buffer: {:#?}",
-                    err
-                ),
-            }
-        });
+                .await;
 
-        Ok(())
+            self.language = language.ok();
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn try_set_source_languages<C: Context>(
+        &mut self,
+        cx: &mut C,
+        for_cells: Option<Vec<&Cell>>,
+    ) -> Vec<CellId> {
+        let mut res = Vec::<CellId>::new();
+        if self.language.is_none() {
+            return res;
+        }
+        for cell in for_cells.unwrap_or_else(|| self.cells.iter().collect_vec()) {
+            cell.source.update(cx, |buffer, cx| {
+                buffer.set_language(self.language.clone(), cx);
+                res.push(cell.id.get());
+            });
+        }
+
+        res
     }
 }
 
@@ -141,8 +144,15 @@ impl<'cx> NotebookBuilder<'cx> {
         };
 
         let _ = notebook
-            .try_set_source_languages(&self.project_handle, &mut self.cx)
+            .try_get_notebook_language(&self.project_handle, &mut self.cx)
             .await;
+        do_in!(|| {
+            let _ = self
+                .cx
+                .update_model(&self.project_handle.upgrade()?, |_project_handle, cx| {
+                    notebook.try_set_source_languages(cx, None);
+                });
+        });
 
         Ok(notebook)
     }

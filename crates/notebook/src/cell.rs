@@ -314,23 +314,19 @@ impl Cells {
         &self,
         buffer_handle: &Model<Buffer>,
         cx: &C,
-    ) -> Option<&Cell>
-    where
-        C::Result<BufferId>: Into<BufferId>,
-    {
-        let target_buffer_id: BufferId = buffer_handle
-            .read_with(cx, |buffer, cx| buffer.remote_id())
-            .into();
-        for cell in self.tree.iter() {
-            let buffer_id: BufferId = cell
-                .source
-                .read_with(cx, |buffer, cx| buffer.remote_id())
-                .into();
-            if target_buffer_id == buffer_id {
-                return Some(cell);
+    ) -> Option<&Cell> {
+        let mut res: Option<&Cell> = None;
+        buffer_handle.read_with(cx, |buffer, cx| {
+            let target_buffer_id = buffer.remote_id();
+            for cell in self.tree.iter() {
+                cell.source.read_with(cx, |buffer, _cx| {
+                    if target_buffer_id == buffer.remote_id() {
+                        res.replace(cell);
+                    };
+                })
             }
-        }
-        return None;
+        });
+        res
     }
 
     pub(crate) fn try_replace_with<C: Context, F>(
