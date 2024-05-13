@@ -1,3 +1,4 @@
+use crate::jupyter::message::{IoPubSubMessageType, MessageType};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::{HashMap, VecDeque};
@@ -460,14 +461,12 @@ impl Cells {
 
             Ok(())
         })
-
-        // })
     }
 
     pub(crate) fn update_cell_from_msg<C: Context>(
-        &self,
+        &mut self,
         cell_id: &CellId,
-        msg: Message,
+        mut msg: Message,
         cx: &mut C,
     ) -> Result<()>
     where
@@ -477,22 +476,52 @@ impl Cells {
             return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
         };
 
-        let output_buffer_handle = match cell.output_content.as_ref() {
+        let buffer_handle = match cell.output_content.as_ref() {
             Some(buffer_handle) => buffer_handle.clone(),
             None => {
-                // TODO
-                cx.new_model(|cx| Buffer::local("", cx)).into()
+                let buffer_handle = cx.new_model(|cx| Buffer::local("", cx)).into();
+                self.try_replace_with(cx, &cell.id.get(), |cell| {
+                    let mut replacement = cell.clone();
+                    replacement.output_content.replace(buffer_handle.clone());
+                    Ok(replacement)
+                });
+                buffer_handle
             }
         };
 
-        // TODO: We need to check the parent message ID/execution count to ensure we only clear cell outputs
-        //       upon a new execution.
-        // cx.update_model(&output_buffer_handle, |buffer, cx| {
-        //;
-        //     // let excerpt_id = cell.
+        match msg.msg_type {
+            MessageType::IoPubSub(io_pubsub_msg_type) => match io_pubsub_msg_type {
+                IoPubSubMessageType::Stream => {
+                    do_in!(|| {
+                        let text: String =
+                            serde_json::from_value(msg.content.remove("text")?).ok()?;
+                        buffer_handle.update(cx, |buffer, cx| buffer.set_text(text, cx));
+                    });
+                }
+                IoPubSubMessageType::ExecutionError => {
+                    do_in!(|| {
+                        let error_name: String =
+                            serde_json::from_value(msg.content.remove("ename")?).ok()?;
+                        let error_value: String =
+                            serde_json::from_value(msg.content.remove("evalue")?).ok()?;
+                        let traceback: Vec<String> =
+                            serde_json::from_value(msg.content.remove("traceback")?).ok()?;
 
-        //     Ok(())
-        // });
+                        buffer_handle.update(cx, |buffer, cx| {
+                            let text = format!(
+                                "{}: {}\n{}",
+                                error_name,
+                                error_value,
+                                traceback.join("\n")
+                            );
+                            buffer.set_text(text, cx);
+                        });
+                    });
+                }
+                _ => {}
+            },
+            _ => {}
+        }
 
         Ok(())
     }

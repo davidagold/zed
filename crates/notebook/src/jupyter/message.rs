@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::cell::{MimeData, StreamOutputTarget};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Message {
     pub(crate) header: MessageHeader,
     pub(crate) msg_id: String,
@@ -20,7 +20,7 @@ pub struct Message {
     pub(crate) buffers: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct MessageHeader {
     pub(crate) msg_id: String,
     pub(crate) session: String,
@@ -30,7 +30,7 @@ pub struct MessageHeader {
     pub(crate) version: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum MessageType {
     Shell(ShellMessageType),
     IoPubSub(IoPubSubMessageType),
@@ -84,7 +84,7 @@ impl<'de> Deserialize<'de> for MessageType {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum ShellMessageType {
     #[serde(rename = "execute_request")]
     ExecuteRequest,
@@ -120,7 +120,7 @@ pub enum ShellMessageType {
     KernelInfoReply,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum IoPubSubMessageType {
     #[serde(rename = "stream")]
     Stream,

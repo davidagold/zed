@@ -90,9 +90,11 @@ impl NotebookEditor {
                 &client_handle,
                 |this, client_handle, event: &KernelEvent, cx| {
                     warn!("{:#?}", event);
-                    match event {
+                    match event.clone() {
                         KernelEvent::ReceivedKernelMessage { msg, cell_id } => {
-                            //
+                            this.notebook.update(cx, |notebook, cx| {
+                                notebook.cells.update_cell_from_msg(&cell_id, msg, cx);
+                            })
                         }
                     }
                     //

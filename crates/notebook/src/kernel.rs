@@ -243,7 +243,7 @@ impl KernelCommand {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum KernelEvent {
     ReceivedKernelMessage {
         msg: jupyter::message::Message,
