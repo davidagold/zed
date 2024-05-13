@@ -222,7 +222,6 @@ impl project::Item for Notebook {
     where
         Self: Sized,
     {
-        info!("Trying to open notebook");
         // TODO: If the workspace has an active `NotebookEditor` view for the requested `path`,
         //       we should activate the existing view.
         if !path.path.extension().is_some_and(|ext| ext == "ipynb") {
@@ -238,13 +237,7 @@ impl project::Item for Notebook {
                     project.open_buffer(cloned_path.clone(), cx)
                 })
                 .map_err(|err| anyhow!("Failed to open file: {:#?}", err))?
-                .await
-                .inspect(|_| {
-                    info!(
-                        "Successfully opened notebook file from path `{:#?}`",
-                        cloned_path
-                    )
-                })?;
+                .await?;
 
             let cloned_project = project.clone();
 
@@ -289,6 +282,7 @@ impl project::Item for Notebook {
                 let sys = py.import_bound("sys")?;
                 let version = sys.getattr("version")?;
 
+                // TODO: Obtain this programmatically
                 let path = "/Users/davidgold/Projects/zed/crates/notebook/src/jupyter";
                 sys.getattr("path")?.call_method1("insert", (0, path))?;
                 do_in!(|| {
@@ -305,7 +299,7 @@ impl project::Item for Notebook {
 
                 Ok(())
             }) {
-                error!("{}", format!("Failed to initialize Python process: {err}"));
+                error!("Failed to initialize Python process: {:#?}", err);
                 return Err(err.into());
             };
             notebook

@@ -17,7 +17,6 @@ use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
 use text::{Bias, BufferId};
 use ui::Context;
-use util::post_inc;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -44,9 +43,7 @@ impl Cell {
                 &self.cell_type,
                 false,
             );
-            let title_path = title.path().clone();
             buffer.file_updated(Arc::new(title), cx);
-            info!("Title updated to {:#?}", title_path);
         });
         do_in!(
             || cx.update_model(self.output_content.as_ref()?, |buffer, cx| {
@@ -56,9 +53,7 @@ impl Cell {
                     &self.cell_type,
                     true,
                 );
-                let title_path = title.path().clone();
                 buffer.file_updated(Arc::new(title), cx);
-                info!("Title updated to {:#?}", title_path);
             })
         );
     }
@@ -264,7 +259,6 @@ impl<'de> serde::Deserialize<'de> for CellType {
 }
 
 pub(crate) fn insert_as_excerpts_into_multibuffer(
-    // buffer_handle: &Model<Buffer>,
     buffer_handles: impl IntoIterator<Item = Model<Buffer>>,
     prev_excerpt_id: u64,
     multi: &mut MultiBuffer,
@@ -369,7 +363,7 @@ impl Cells {
     pub(crate) fn insert<C: Context>(
         &mut self,
         cells_iter: impl IntoIterator<Item = Cell>,
-        cx: &mut C, // cx: &mut ModelContext<Notebook>,
+        cx: &mut C,
         replace: bool,
     ) -> C::Result<Result<()>> {
         let mut cells: VecDeque<Cell> = cells_iter.into_iter().collect();
@@ -385,7 +379,6 @@ impl Cells {
             let mut cursor = self.tree.cursor::<CellId>();
             let keep_as_is = cursor.slice(&id_first_to_insert, Bias::Left, &());
             let prev_cell = cursor.prev_item().ok_or_else(|| anyhow!("Nope"));
-            warn!("prev_cell: {:#?}", prev_cell);
 
             let prev_excerpt_id = prev_cell
                 .and_then(|cell| {
@@ -395,14 +388,11 @@ impl Cells {
                             cx,
                         )
                         .last()
-                        .ok_or_else(|| anyhow!("Failed to obtain next excerpt ID"))
-                        .inspect_err(|err| error!("{:#?}", err))?
+                        .ok_or_else(|| anyhow!("Failed to obtain next excerpt ID"))?
                         .0;
                     Ok(excerpt_id)
                 })
                 .unwrap_or(ExcerptId::min());
-
-            warn!("prev_excerpt_id: {:#?}", prev_excerpt_id);
 
             let mut ids_excerpts_to_remove = Vec::<ExcerptId>::new();
             let mut cells_to_shift = Vec::<Cell>::new();
@@ -518,15 +508,16 @@ impl Cells {
                         });
                     });
                 }
+                // TODO: Remaining PubSub message types
                 _ => {}
             },
+            // TODO: Remaining message types where applicable
             _ => {}
         }
 
         Ok(())
     }
 
-    // TODO: We no longer need excerpt ID to live in cell so this is just kind of confusing being down here
     pub fn from_builders<'c>(
         builders: Vec<CellBuilder>,
         cx: &mut AsyncAppContext,
@@ -542,10 +533,6 @@ impl Cells {
 #[derive(Clone, Debug, Default)]
 pub struct CellSummary {
     num_cells_inclusive: u64,
-    // A "block" is an entity whose view both
-    //   - takes up vertical space in the notebook view and
-    //   - belongs to the same `div` level as a cell in the notebook view
-    num_blocks_inclusive: u64,
 }
 
 impl Summary for CellSummary {
@@ -553,7 +540,6 @@ impl Summary for CellSummary {
 
     fn add_summary(&mut self, summary: &Self, _cx: &Self::Context) {
         self.num_cells_inclusive += summary.num_cells_inclusive;
-        self.num_blocks_inclusive += summary.num_blocks_inclusive;
     }
 }
 
@@ -563,7 +549,6 @@ impl sum_tree::Item for Cell {
     fn summary(&self) -> Self::Summary {
         CellSummary {
             num_cells_inclusive: 1,
-            num_blocks_inclusive: 1 + (if self.output_content.is_some() { 1 } else { 0 }),
         }
     }
 }
@@ -621,50 +606,6 @@ impl CellId {
         let id = *self;
         self.0 += 1;
         id
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, PartialOrd, Ord, Eq)]
-pub struct BlockId(u64);
-
-impl From<BlockId> for u64 {
-    fn from(id: BlockId) -> Self {
-        id.0
-    }
-}
-
-// This only works for now because all blocks are excerpts and all excerpts are blocks.
-// In the near future that may cease to be true, in which case we'll something like
-// a `BufferBlockId` (and the guarantee that each excerpt corresponds to a buffer).
-impl From<ExcerptId> for BlockId {
-    fn from(id: ExcerptId) -> Self {
-        BlockId::from(id.to_proto())
-    }
-}
-
-impl From<u64> for BlockId {
-    fn from(id: u64) -> Self {
-        BlockId(id)
-    }
-}
-
-impl<'a> Dimension<'a, CellSummary> for BlockId {
-    fn add_summary(&mut self, summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
-        *self = BlockId(self.0 + summary.num_blocks_inclusive)
-    }
-    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
-        BlockId(summary.num_blocks_inclusive)
-    }
-}
-
-impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for BlockId {
-    fn cmp(
-        &self,
-        cursor_location: &CellSummary,
-        cx: &<CellSummary as Summary>::Context,
-    ) -> std::cmp::Ordering {
-        Ord::cmp(&self.0, &cursor_location.num_blocks_inclusive)
     }
 }
 

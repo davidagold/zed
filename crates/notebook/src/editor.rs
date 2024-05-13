@@ -77,9 +77,7 @@ impl NotebookEditor {
                     EditorEvent::TitleChanged => {
                         cx.notify();
                     }
-                    _ => {
-                        // log::info!("Event: {:#?}", event);
-                    }
+                    _ => {}
                 }
             }),
         );
@@ -97,7 +95,6 @@ impl NotebookEditor {
                             })
                         }
                     }
-                    //
                 },
             ));
         };
@@ -114,7 +111,6 @@ impl NotebookEditor {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
-        // self.editor.update(cx, f)
         if let Err(err) = self
             .notebook
             .read_with(cx, |notebook, cx| {
@@ -131,16 +127,14 @@ impl NotebookEditor {
                     let response = client_handle.run_cell(&current_cell, cx)?;
                     anyhow::Ok((current_cell, response))
                 })
-                // let response = ?
             })
             .and_then(|(mut current_cell, response)| {
-                info!("{:#?}", response);
                 if current_cell.output_content.is_some() {
                     current_cell.output_content = None;
                     self.notebook.update(cx, |notebook, cx| {
                         notebook
                             .cells
-                            // TODO: Update execution count
+                            // TODO: Update execution count and so on
                             .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
                     })?;
                 };
@@ -183,11 +177,9 @@ impl NotebookEditor {
             };
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
-            self.notebook.update(cx, |notebook, cx| {
+            let _ = self.notebook.update(cx, |notebook, cx| {
                 notebook.cells.insert(vec![cell], cx, false)
             });
-
-            cx.refresh()
         });
     }
 
