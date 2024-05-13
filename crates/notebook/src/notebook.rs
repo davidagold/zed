@@ -14,7 +14,7 @@ use collections::HashMap;
 use gpui::{AsyncAppContext, Context, Model, WeakModel};
 use itertools::Itertools;
 use kernel::JupyterKernelClient;
-use language::{Buffer, Language};
+use language::Language;
 use log::{error, info};
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
@@ -40,7 +40,7 @@ pub struct Notebook {
 impl Notebook {
     fn kernel_spec(&self) -> Option<KernelSpec> {
         self.metadata.clone().and_then(|metadata| {
-            Some(serde_json::from_value(metadata.get("kernel_spec")?.clone()).ok()?)
+            Some(serde_json::from_value(metadata.get("kernelspec")?.clone()).ok()?)
         })
     }
 
@@ -56,18 +56,14 @@ impl Notebook {
         cx: &mut AsyncAppContext,
     ) -> anyhow::Result<()> {
         if self.language.is_none() {
-            let Some(kernel_spec) = (&self.metadata).as_ref().and_then(|metadata| {
-                log::info!("NotebookBuilder.metadata: {:#?}", metadata);
-                serde_json::from_value::<KernelSpec>(metadata.get("kernelspec")?.clone()).ok()
-            }) else {
+            let Some(kernel_spec) = self.kernel_spec() else {
                 return Err(anyhow!("No kernel spec"));
             };
-
             let cloned_project = project.clone();
             let language = cx
                 .spawn(|cx| async move {
                     match kernel_spec.language.as_str() {
-                        "python" => cloned_project.read_with(&cx, |project, cx| {
+                        "python" => cloned_project.read_with(&cx, |project, _cx| {
                             let languages = project.languages();
                             languages.language_for_name("Python")
                         }),
@@ -78,10 +74,8 @@ impl Notebook {
                 .await;
 
             self.language = language.ok();
-            Ok(())
-        } else {
-            Ok(())
-        }
+        };
+        Ok(())
     }
 
     pub(crate) fn try_set_source_languages<C: Context>(
@@ -146,13 +140,12 @@ impl<'cx> NotebookBuilder<'cx> {
         let _ = notebook
             .try_get_notebook_language(&self.project_handle, &mut self.cx)
             .await;
-        do_in!(|| {
-            let _ = self
-                .cx
-                .update_model(&self.project_handle.upgrade()?, |_project_handle, cx| {
-                    notebook.try_set_source_languages(cx, None);
-                });
-        });
+        let _ = do_in!(|| self.cx.update_model(
+            &self.project_handle.upgrade()?,
+            |_project_handle, cx| {
+                notebook.try_set_source_languages(cx, None);
+            }
+        ));
 
         Ok(notebook)
     }
