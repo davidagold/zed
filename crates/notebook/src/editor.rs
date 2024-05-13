@@ -1,22 +1,22 @@
 //! Jupyter support for Zed.
 
-use collections::HashMap;
-use editor::{
-    items::entry_label_color, Editor, EditorEvent, ExcerptId, MultiBuffer, MAX_TAB_TITLE_LEN,
-};
+use anyhow::anyhow;
+use editor::{items::entry_label_color, Editor, EditorEvent, MAX_TAB_TITLE_LEN};
 use gpui::{
-    AnyView, AppContext, Context, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
-use language::{self, Buffer, Capability};
+use language::Buffer;
+use log::{error, info, warn};
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
 };
+use text::Bias;
 use ui::{
-    div, h_flex, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon, Render,
-    SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
+    Render, SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
@@ -24,7 +24,9 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{excerpt_range_over_buffer, CellId},
+    cell::{Cell, CellBuilder},
+    do_in,
+    kernel::{JupyterKernelClient, KernelEvent},
     Notebook,
 };
 
@@ -36,46 +38,12 @@ pub struct NotebookEditor {
 }
 
 impl NotebookEditor {
-    fn new(project: Model<Project>, notebook: Model<Notebook>, cx: &mut ViewContext<Self>) -> Self {
-        let cells = notebook.read(cx).cells.clone();
-
-        let multi = cx.new_model(|model_cx| {
-            let mut multi = MultiBuffer::new(0, Capability::ReadWrite);
-            let mut output_content_by_cell_id: HashMap<&CellId, Model<Buffer>> = cells
-                .iter()
-                .filter_map(|cell| Some((&cell.id, cell.output_content.clone()?)))
-                .collect();
-
-            // TODO: Actually guarantee some invariance in `CellId` -> `ExcerptId`
-            let mut prev_excerpt_id = ExcerptId::min();
-            for cell in cells.iter() {
-                let id: u64 = prev_excerpt_id.to_proto() + 1;
-
-                // Handle source buffer
-                let range = excerpt_range_over_buffer(&cell.source, model_cx);
-                multi.insert_excerpts_with_ids_after(
-                    prev_excerpt_id,
-                    cell.source.clone(),
-                    vec![(ExcerptId::from_proto(id), range)],
-                    model_cx,
-                );
-                prev_excerpt_id = ExcerptId::from_proto(id);
-
-                // Handle output buffer if present
-                if let Some(output_buffer) = output_content_by_cell_id.remove(&cell.id) {
-                    let range = excerpt_range_over_buffer(&output_buffer, model_cx);
-                    multi.insert_excerpts_with_ids_after(
-                        prev_excerpt_id,
-                        output_buffer,
-                        vec![(ExcerptId::from_proto(id + 1), range)],
-                        model_cx,
-                    );
-                    prev_excerpt_id = ExcerptId::from_proto(id + 1);
-                }
-            }
-
-            multi
-        });
+    fn new(
+        project: Model<Project>,
+        notebook_handle: Model<Notebook>,
+        cx: &mut ViewContext<Self>,
+    ) -> Self {
+        let multi = notebook_handle.read(cx).cells.multi.clone();
 
         let editor = cx.new_view(|cx| {
             let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
@@ -95,43 +63,124 @@ impl NotebookEditor {
         // TODO: Figure out what goes here.
         // cx.on_focus_out(&focus_handle, |this, cx| {})
         // .detach();
+        //
+        let mut subscriptions = Vec::<Subscription>::new();
 
-        let subscription = cx.subscribe(&project, |this, project, event, cx| {
+        subscriptions.push(cx.subscribe(&project, |_this, _project, event, _cx| {
             log::info!("Event: {:#?}", event);
-        });
-
-        cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
-            cx.emit(event.clone());
-            match event {
-                EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
-                _ => {
-                    log::info!("Event: {:#?}", event);
+        }));
+        subscriptions.push(
+            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
+                cx.emit(event.clone());
+                match event {
+                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                    EditorEvent::TitleChanged => {
+                        cx.notify();
+                    }
+                    _ => {}
                 }
-            }
-        })
-        .detach();
+            }),
+        );
+        if let Some(client_handle) =
+            notebook_handle.read_with(cx, |notebook, cx| notebook.client_handle.clone())
+        {
+            subscriptions.push(cx.subscribe(
+                &client_handle,
+                |this, client_handle, event: &KernelEvent, cx| {
+                    warn!("{:#?}", event);
+                    match event.clone() {
+                        KernelEvent::ReceivedKernelMessage { msg, cell_id } => {
+                            this.notebook.update(cx, |notebook, cx| {
+                                notebook.cells.update_cell_from_msg(&cell_id, msg, cx);
+                            })
+                        }
+                    }
+                },
+            ));
+        };
 
         NotebookEditor {
-            notebook,
+            notebook: notebook_handle,
             editor,
             focus_handle,
-            _subscriptions: [subscription].into(),
+            _subscriptions: subscriptions,
         }
     }
 
-    fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) {
-        let (excerpt_id, buffer_handle, _range) = match self.editor.read(cx).active_excerpt(cx) {
-            Some(data) => data,
-            None => return,
+    fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) -> () {
+        let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
+            return ();
         };
-        let entity_id = cx.entity_id();
-        let buffer = buffer_handle.read(cx);
-        log::info!(
-            "Active cell's `NotebookEditor`'s `EntityId`: {:#?}",
-            entity_id
-        );
-        log::info!("Active cell's `ExcerptId`: {:#?}", excerpt_id);
-        log::info!("Active cell's buffer: {:#?}", buffer.text());
+        if let Err(err) = self
+            .notebook
+            .read_with(cx, |notebook, cx| {
+                do_in!(|| -> Option<(Cell, &JupyterKernelClient)> {
+                    let current_cell = notebook
+                        .cells
+                        .get_cell_by_buffer(&buffer_handle, cx)?
+                        .clone();
+                    let client_handle = notebook.client_handle.as_ref()?.read(cx);
+                    Some((current_cell, client_handle))
+                })
+                .ok_or_else(|| anyhow!("Failed to get current cell or client handle"))
+                .and_then(|(current_cell, client_handle)| {
+                    let response = client_handle.run_cell(&current_cell, cx)?;
+                    anyhow::Ok((current_cell, response))
+                })
+            })
+            .and_then(|(mut current_cell, response)| {
+                if current_cell.output_content.is_some() {
+                    current_cell.output_content = None;
+                    self.notebook.update(cx, |notebook, cx| {
+                        notebook
+                            .cells
+                            // TODO: Update execution count and so on
+                            .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
+                    })?;
+                };
+                Ok(())
+            })
+        {
+            error!("{:#?}", err);
+        }
+    }
+
+    fn insert_cell_above(
+        &mut self,
+        _cmd: &actions::InsertCellAbove,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
+        self.insert_cell(Bias::Left, cx)
+    }
+
+    fn insert_cell_below(
+        &mut self,
+        _cmd: &actions::InsertCellBelow,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
+        self.insert_cell(Bias::Right, cx)
+    }
+
+    fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
+        let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
+            return ();
+        };
+
+        do_in!(|| {
+            let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
+                let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
+                Some(current_cell.id.get().clone())
+            })?;
+            let new_cell_id = match bias {
+                Bias::Left => current_cell_id,
+                Bias::Right => current_cell_id.pre_inc(),
+            };
+            let source = cx.new_model(|cx| Buffer::local("", cx));
+            let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
+            let _ = self.notebook.update(cx, |notebook, cx| {
+                notebook.cells.insert(vec![cell], cx, false)
+            });
+        });
     }
 
     fn toggle_notebook_view(&mut self, cmd: &super::actions::ToggleNotebookView) {}
@@ -142,7 +191,7 @@ const NOTEBOOK_KIND: &'static str = "NotebookEditor";
 impl workspace::item::Item for NotebookEditor {
     type Event = EditorEvent;
 
-    fn to_item_events(event: &Self::Event, f: impl FnMut(ItemEvent)) {
+    fn to_item_events(event: &EditorEvent, f: impl FnMut(ItemEvent)) {
         Editor::to_item_events(event, f)
     }
 
@@ -244,6 +293,8 @@ impl Render for NotebookEditor {
             .size_full()
             .child(self.editor.clone())
             .on_action(cx.listener(NotebookEditor::run_current_cell))
+            .on_action(cx.listener(NotebookEditor::insert_cell_above))
+            .on_action(cx.listener(NotebookEditor::insert_cell_below))
     }
 }
 
