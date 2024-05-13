@@ -6,7 +6,7 @@ use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::{chain, Itertools};
 use language::{Buffer, Capability, File};
-use log::{error, info, warn};
+use log::error;
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::cell::Cell as StdCell;
 use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
-use text::{Bias, BufferId};
+use text::Bias;
 use ui::Context;
 
 #[derive(Clone, Debug)]
@@ -470,7 +470,7 @@ impl Cells {
                     let mut replacement = cell.clone();
                     replacement.output_content.replace(buffer_handle.clone());
                     Ok(replacement)
-                });
+                })?;
                 buffer_handle
             }
         };

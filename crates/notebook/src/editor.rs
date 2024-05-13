@@ -7,7 +7,7 @@ use gpui::{
     Subscription, View,
 };
 use language::Buffer;
-use log::{error, info, warn};
+use log::{error, warn};
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
@@ -15,8 +15,8 @@ use std::{
 };
 use text::Bias;
 use ui::{
-    div, h_flex, BorrowAppContext, Context, FluentBuilder, InteractiveElement, IntoElement, Label,
-    LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
+    Render, SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
@@ -70,7 +70,7 @@ impl NotebookEditor {
             log::info!("Event: {:#?}", event);
         }));
         subscriptions.push(
-            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
+            cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
                 cx.emit(event.clone());
                 match event {
                     EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
@@ -82,18 +82,15 @@ impl NotebookEditor {
             }),
         );
         if let Some(client_handle) =
-            notebook_handle.read_with(cx, |notebook, cx| notebook.client_handle.clone())
+            notebook_handle.read_with(cx, |notebook, _cx| notebook.client_handle.clone())
         {
             subscriptions.push(cx.subscribe(
                 &client_handle,
-                |this, client_handle, event: &KernelEvent, cx| {
-                    warn!("{:#?}", event);
-                    match event.clone() {
-                        KernelEvent::ReceivedKernelMessage { msg, cell_id } => {
-                            this.notebook.update(cx, |notebook, cx| {
-                                notebook.cells.update_cell_from_msg(&cell_id, msg, cx);
-                            })
-                        }
+                |this, _client_handle, event: &KernelEvent, cx| match event.clone() {
+                    KernelEvent::ReceivedKernelMessage { msg, cell_id } => {
+                        this.notebook.update(cx, |notebook, cx| {
+                            notebook.cells.update_cell_from_msg(&cell_id, msg, cx);
+                        })
                     }
                 },
             ));
@@ -128,7 +125,7 @@ impl NotebookEditor {
                     anyhow::Ok((current_cell, response))
                 })
             })
-            .and_then(|(mut current_cell, response)| {
+            .and_then(|(mut current_cell, _response)| {
                 if current_cell.output_content.is_some() {
                     current_cell.output_content = None;
                     self.notebook.update(cx, |notebook, cx| {
@@ -188,8 +185,6 @@ impl NotebookEditor {
             });
         });
     }
-
-    fn toggle_notebook_view(&mut self, cmd: &super::actions::ToggleNotebookView) {}
 }
 
 const NOTEBOOK_KIND: &'static str = "NotebookEditor";
@@ -271,7 +266,7 @@ impl workspace::item::Item for NotebookEditor {
         &'a self,
         type_id: TypeId,
         self_handle: &'a View<Self>,
-        cx: &'a AppContext,
+        _cx: &'a AppContext,
     ) -> Option<AnyView> {
         if type_id == TypeId::of::<Self>() {
             Some(self_handle.to_any())
@@ -287,7 +282,6 @@ impl EventEmitter<EditorEvent> for NotebookEditor {}
 
 impl FocusableView for NotebookEditor {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-        // self.focus_handle.clone()
         self.editor.focus_handle(cx).clone()
     }
 }

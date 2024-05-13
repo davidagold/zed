@@ -1,11 +1,3 @@
-use gpui::{actions, impl_actions};
-use serde::Deserialize;
-
-#[derive(Clone, Deserialize, PartialEq, Default)]
-pub enum ToggleNotebookView {
-    #[default]
-    NotebookEditor,
-    Raw,
-}
+use gpui::actions;
 
 actions!(notebook, [RunCurrentCell, InsertCellAbove, InsertCellBelow]);
