@@ -15,8 +15,8 @@ use std::{
 };
 use text::Bias;
 use ui::{
-    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
-    Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, BorrowAppContext, Context, FluentBuilder, InteractiveElement, IntoElement, Label,
+    LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
 };
 
 use util::paths::PathExt;
@@ -24,7 +24,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellBuilder},
+    cell::{Cell, CellBuilder, CellType},
     do_in,
     kernel::{JupyterKernelClient, KernelEvent},
     Notebook,
@@ -178,7 +178,13 @@ impl NotebookEditor {
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
             let _ = self.notebook.update(cx, |notebook, cx| {
-                notebook.cells.insert(vec![cell], cx, false)
+                match cell.cell_type {
+                    CellType::Code => {
+                        notebook.try_set_source_languages(cx, Some(vec![&cell]));
+                    }
+                    _ => {}
+                }
+                notebook.cells.insert(vec![cell], cx, false);
             });
         });
     }
