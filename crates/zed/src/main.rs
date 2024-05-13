@@ -134,6 +134,7 @@ fn init_ui(app_state: Arc<AppState>, cx: &mut AppContext) -> Result<()> {
     command_palette::init(cx);
     editor::init(cx);
     image_viewer::init(cx);
+    notebook::editor::init(cx);
     diagnostics::init(cx);
 
     audio::init(Assets, cx);
@@ -360,7 +361,6 @@ fn main() {
         project::Project::init(&client, cx);
         client::init(&client, cx);
         language::init(cx);
-        editor::init(cx);
 
         let telemetry = client.telemetry();
         telemetry.start(installation_id.clone(), session_id, cx);
