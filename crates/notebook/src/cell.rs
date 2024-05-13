@@ -1,6 +1,6 @@
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
-use collections::HashMap;
+use collections::{HashMap, VecDeque};
 use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::{chain, Itertools};
@@ -62,11 +62,10 @@ impl Cell {
         );
     }
 
-    fn increment_id<C: Context>(self, cx: &mut C) -> Self {
+    fn increment_id<C: Context>(&self, cx: &mut C) {
         let incremented_id = self.id.get().pre_inc();
         self.id.set(incremented_id);
         self.update_titles(cx);
-        self
     }
 }
 
@@ -266,7 +265,7 @@ impl<'de> serde::Deserialize<'de> for CellType {
 pub(crate) fn insert_as_excerpts_into_multibuffer(
     // buffer_handle: &Model<Buffer>,
     buffer_handles: impl IntoIterator<Item = Model<Buffer>>,
-    mut prev_excerpt_id: u64,
+    prev_excerpt_id: u64,
     multi: &mut MultiBuffer,
     cx: &mut ModelContext<MultiBuffer>,
 ) -> Result<()> {
@@ -310,12 +309,6 @@ impl Cells {
         self.tree.cursor::<D>()
     }
 
-    pub fn get_cell_by_excerpt_id(&self, excerpt_id: &ExcerptId) -> Option<&Cell> {
-        let mut cursor = self.cursor::<BlockId>();
-        cursor.seek_forward(&BlockId::from(*excerpt_id), text::Bias::Left, &());
-        cursor.item()
-    }
-
     pub fn get_cell_by_id(&self, cell_id: &CellId) -> Option<&Cell> {
         let mut cursor = self.cursor::<CellId>();
         cursor.seek_forward(cell_id, text::Bias::Left, &());
@@ -345,11 +338,16 @@ impl Cells {
         return None;
     }
 
-    fn try_replace_with<F>(&mut self, cell_id: CellId, f: F) -> Result<Cell>
+    pub(crate) fn try_replace_with<C: Context, F>(
+        &mut self,
+        cx: &mut C,
+        cell_id: &CellId,
+        f: F,
+    ) -> Result<Cell>
     where
         F: FnOnce(&Cell) -> Result<Cell>,
     {
-        let Some(old_cell) = self.tree.get(&cell_id, &()) else {
+        let Some(old_cell) = self.tree.get(cell_id, &()) else {
             let err = anyhow!("Cannot replace nonexistent cell with ID {:#?}", cell_id);
             return Err(err);
         };
@@ -361,6 +359,7 @@ impl Cells {
                 old_cell.id
             ));
         };
+        self.insert(vec![new_cell.clone()], cx, true);
         self.tree.insert_or_replace(new_cell, &()).ok_or_else(|| {
             anyhow!("Inserted new cell without replacing old, tree is likely corrupted")
         })
@@ -368,9 +367,11 @@ impl Cells {
 
     pub(crate) fn insert<C: Context>(
         &mut self,
-        cells: Vec<Cell>,
+        cells_iter: impl IntoIterator<Item = Cell>,
         cx: &mut C, // cx: &mut ModelContext<Notebook>,
+        replace: bool,
     ) -> C::Result<Result<()>> {
+        let mut cells: VecDeque<Cell> = cells_iter.into_iter().collect();
         self.multi.update(cx, |multi, cx| {
             if cells.is_empty() {
                 return Err(anyhow!("No cells to insert"));
@@ -378,7 +379,7 @@ impl Cells {
             for cell in cells.iter() {
                 cell.update_titles(cx);
             }
-            let id_first_to_insert = cells.first().unwrap().id.get();
+            let id_first_to_insert = cells.front().unwrap().id.get();
 
             let mut cursor = self.tree.cursor::<CellId>();
             let keep_as_is = cursor.slice(&id_first_to_insert, Bias::Left, &());
@@ -401,19 +402,20 @@ impl Cells {
                 .unwrap_or(ExcerptId::min());
 
             warn!("prev_excerpt_id: {:#?}", prev_excerpt_id);
-            warn!("next_excerpt_id: {:#?}", cursor.item());
 
             let mut ids_excerpts_to_remove = Vec::<ExcerptId>::new();
             let mut cells_to_shift = Vec::<Cell>::new();
-            while let Some(cell) = cursor.item() {
-                cells_to_shift.push(cell.clone().increment_id(cx));
+
+            while let Some(cell) = cursor.item().cloned() {
+                if !replace {
+                    cell.increment_id(cx);
+                }
                 ids_excerpts_to_remove.extend(
                     multi
                         .excerpts_for_buffer(&cell.source, cx)
                         .into_iter()
                         .map(|(id, _)| id),
                 );
-
                 do_in!(|| {
                     ids_excerpts_to_remove.extend(
                         multi
@@ -422,6 +424,16 @@ impl Cells {
                             .map(|(id, _)| id),
                     )
                 });
+                if replace {
+                    if let Some(replacement) = cells.pop_front() {
+                        cells_to_shift.push(replacement.clone())
+                    } else {
+                        cells_to_shift.push(cell);
+                    }
+                } else {
+                    cells_to_shift.push(cell);
+                }
+
                 cursor.next(&());
             }
 
@@ -494,7 +506,7 @@ impl Cells {
         let multi = cx.new_model(|_cx| MultiBuffer::new(0, Capability::ReadWrite))?;
         let mut this = Cells { tree, multi };
         let cells_to_insert = builders.into_iter().map(|b| b.build()).collect_vec();
-        this.insert(cells_to_insert, cx).map(|_| this)
+        this.insert(cells_to_insert, cx, false).map(|_| this)
     }
 }
 

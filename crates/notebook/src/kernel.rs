@@ -9,6 +9,7 @@ use pyo3::types::{PyAnyMethods, PyDict, PyString, PyTuple};
 use pyo3::{pyclass, Bound, Py, PyAny, PyResult, Python};
 use ui::{Context, ViewContext};
 
+use std::sync::mpsc::TrySendError;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -77,13 +78,19 @@ impl JupyterKernelClient {
         Ok(client_handle)
     }
 
-    pub(crate) fn run_cell(
+    pub(crate) fn run_cell<C: Context>(
         &self,
         cell: &Cell,
-        cx: &ViewContext<NotebookEditor>,
-    ) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {
-        let code = cell.source.read(cx).text_snapshot().text();
-        self.send(KernelCommand::run(cell.id.get(), code))
+        cx: &C,
+    ) -> Result<(), mpsc::error::TrySendError<KernelCommand>>
+    where
+        C::Result<String>: Into<String>,
+    {
+        let code: String = cell
+            .source
+            .read_with(cx, |buffer, cx| buffer.text_snapshot().text())
+            .into();
+        self.send(KernelCommand::run(cell.id.get(), code)).into()
     }
 
     fn send(&self, cmd: KernelCommand) -> Result<(), mpsc::error::TrySendError<KernelCommand>> {

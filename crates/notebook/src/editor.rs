@@ -1,5 +1,6 @@
 //! Jupyter support for Zed.
 
+use anyhow::anyhow;
 use editor::{items::entry_label_color, Editor, EditorEvent, MAX_TAB_TITLE_LEN};
 use gpui::{
     AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
@@ -22,10 +23,10 @@ use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
-    actions::{self},
-    cell::CellBuilder,
+    actions,
+    cell::{Cell, CellBuilder},
     do_in,
-    kernel::KernelEvent,
+    kernel::{JupyterKernelClient, KernelEvent},
     Notebook,
 };
 
@@ -89,6 +90,11 @@ impl NotebookEditor {
                 &client_handle,
                 |this, client_handle, event: &KernelEvent, cx| {
                     warn!("{:#?}", event);
+                    match event {
+                        KernelEvent::ReceivedKernelMessage { msg, cell_id } => {
+                            //
+                        }
+                    }
                     //
                 },
             ));
@@ -107,21 +113,40 @@ impl NotebookEditor {
             return ();
         };
         // self.editor.update(cx, f)
-
-        do_in!(|| {
-            let notebook = self.notebook.read(cx);
-            let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
-            info!("{:#?}", current_cell.id.get());
-            match notebook
-                .client_handle
-                .as_ref()?
-                .read(cx)
-                .run_cell(current_cell, cx)
-            {
-                Ok(response) => info!("{:#?}", response),
-                Err(err) => error!("{:#?}", err),
-            };
-        });
+        if let Err(err) = self
+            .notebook
+            .read_with(cx, |notebook, cx| {
+                do_in!(|| -> Option<(Cell, &JupyterKernelClient)> {
+                    let current_cell = notebook
+                        .cells
+                        .get_cell_by_buffer(&buffer_handle, cx)?
+                        .clone();
+                    let client_handle = notebook.client_handle.as_ref()?.read(cx);
+                    Some((current_cell, client_handle))
+                })
+                .ok_or_else(|| anyhow!("Failed to get current cell or client handle"))
+                .and_then(|(current_cell, client_handle)| {
+                    let response = client_handle.run_cell(&current_cell, cx)?;
+                    anyhow::Ok((current_cell, response))
+                })
+                // let response = ?
+            })
+            .and_then(|(mut current_cell, response)| {
+                info!("{:#?}", response);
+                if current_cell.output_content.is_some() {
+                    current_cell.output_content = None;
+                    self.notebook.update(cx, |notebook, cx| {
+                        notebook
+                            .cells
+                            // TODO: Update execution count
+                            .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
+                    })?;
+                };
+                Ok(())
+            })
+        {
+            error!("{:#?}", err);
+        }
     }
 
     fn insert_cell_above(
@@ -156,8 +181,9 @@ impl NotebookEditor {
             };
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
-            self.notebook
-                .update(cx, |notebook, cx| notebook.cells.insert(vec![cell], cx));
+            self.notebook.update(cx, |notebook, cx| {
+                notebook.cells.insert(vec![cell], cx, false)
+            });
 
             cx.refresh()
         });
