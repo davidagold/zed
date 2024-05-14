@@ -109,35 +109,33 @@ impl NotebookEditor {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
-        if let Err(err) = self
-            .notebook
-            .read_with(cx, |notebook, cx| {
-                do_in!(|| -> Option<(Cell, &JupyterKernelClient)> {
-                    let current_cell = notebook
-                        .cells
-                        .get_cell_by_buffer(&buffer_handle, cx)?
-                        .clone();
-                    let client_handle = notebook.client_handle.as_ref()?.read(cx);
-                    Some((current_cell, client_handle))
-                })
-                .ok_or_else(|| anyhow!("Failed to get current cell or client handle"))
-                .and_then(|(current_cell, client_handle)| {
-                    let response = client_handle.run_cell(&current_cell, cx)?;
-                    anyhow::Ok((current_cell, response))
-                })
+        if let Err(err) = self.notebook.read_with(cx, |notebook, cx| {
+            do_in!(|| -> Option<(Cell, &JupyterKernelClient)> {
+                let current_cell = notebook
+                    .cells
+                    .get_cell_by_buffer(&buffer_handle, cx)?
+                    .clone();
+                let client_handle = notebook.client_handle.as_ref()?.read(cx);
+                Some((current_cell, client_handle))
             })
-            .and_then(|(mut current_cell, _response)| {
-                if current_cell.output_content.is_some() {
-                    current_cell.output_content = None;
-                    self.notebook.update(cx, |notebook, cx| {
-                        notebook
-                            .cells
-                            // TODO: Update execution count and so on
-                            .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
-                    })?;
-                };
-                Ok(())
+            .ok_or_else(|| anyhow!("Failed to get current cell or client handle"))
+            .and_then(|(current_cell, client_handle)| {
+                let response = client_handle.run_cell(&current_cell, cx)?;
+                anyhow::Ok((current_cell, response))
             })
+        })
+        // .and_then(|(mut current_cell, _response)| {
+        //     if current_cell.output_content.is_some() {
+        //         current_cell.output_content = None;
+        //         self.notebook.update(cx, |notebook, cx| {
+        //             notebook
+        //                 .cells
+        //                 // TODO: Update execution count and so on
+        //                 .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
+        //         })?;
+        //     };
+        //     Ok(())
+        // })
         {
             error!("{:#?}", err);
         }
