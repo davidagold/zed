@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "zed-notebook"
+version = "0.0.1"
+description = "Notebook support for Zed"
+authors = ["David Gold <david.gold.a@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+jupyter-server = "*"
+jupyter-client = "*"
+ipykernel = "*"
+pydantic = "*"
+more-itertools = "*"
+
+[tool.poetry.group.dev.dependencies]
+rich = "*"
+ruff = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
