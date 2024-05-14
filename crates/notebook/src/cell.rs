@@ -397,20 +397,14 @@ impl Cells {
                 if !replace {
                     cell.increment_id(cx);
                 }
-                ids_excerpts_to_remove.extend(
-                    multi
-                        .excerpts_for_buffer(&cell.source, cx)
-                        .into_iter()
-                        .map(|(id, _)| id),
-                );
-                do_in!(|| {
-                    ids_excerpts_to_remove.extend(
+                for buffer in vec![Some(&cell.source), cell.output_content.as_ref()] {
+                    do_in!(|| ids_excerpts_to_remove.extend(
                         multi
-                            .excerpts_for_buffer(cell.output_content.as_ref()?, cx)
+                            .excerpts_for_buffer(buffer?, cx)
                             .into_iter()
-                            .map(|(id, _)| id),
-                    )
-                });
+                            .map(|(id, _)| id)
+                    ));
+                }
                 if replace {
                     if let Some(replacement) = cells.pop_front() {
                         cells_to_shift.push(replacement.clone())
