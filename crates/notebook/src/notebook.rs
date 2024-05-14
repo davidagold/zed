@@ -285,9 +285,9 @@ impl project::Item for Notebook {
                 let sys = py.import_bound("sys")?;
                 let version = sys.getattr("version")?;
 
-                // TODO: Obtain this programmatically
-                let path = "/Users/davidgold/Projects/zed/crates/notebook/src/jupyter";
-                sys.getattr("path")?.call_method1("insert", (0, path))?;
+                let kc_module_dir = std::env::current_dir()?.join("crates/notebook/src/jupyter");
+                sys.getattr("path")?
+                    .call_method1("insert", (0, kc_module_dir.to_str()))?;
                 do_in!(|| {
                     info!("Found Python version: {}", version.__str__()?);
                     let exec = sys.getattr("executable").ok()?;
