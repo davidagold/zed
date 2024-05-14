@@ -6,6 +6,7 @@ use gpui::{
     AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
+use itertools::Itertools;
 use language::Buffer;
 use log::{error, warn};
 use project::{self, Project};
@@ -24,7 +25,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellBuilder, CellType},
+    cell::{Cell, CellBuilder, CellId, CellType},
     do_in,
     kernel::{JupyterKernelClient, KernelEvent},
     Notebook,
@@ -140,6 +141,60 @@ impl NotebookEditor {
         {
             error!("{:#?}", err);
         }
+    }
+
+    fn run_current_selection(
+        &mut self,
+        _: &actions::RunCurrentSelection,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
+        self.notebook.update(cx, |notebook, cx| {
+            let cells = &mut notebook.cells;
+            do_in!(|| {
+                let editor = self.editor.read(cx);
+                let (_, buffer_handle, _) = editor.active_excerpt(cx)?;
+                let mut next_cell_id = cells.get_cell_by_buffer(&buffer_handle, cx)?.id.get();
+                let (_, range, _) = cells
+                    .multi
+                    .read_with(cx, |multi, cx| {
+                        let range_in_multi = editor.selections.newest::<usize>(cx).range();
+                        multi.range_to_buffer_ranges(range_in_multi, cx)
+                    })
+                    .into_iter()
+                    .at_most_one()
+                    .ok()??;
+                let snapshot = buffer_handle.read(cx).text_snapshot();
+                let mut start = 0;
+                for (end, replace) in vec![
+                    (range.start, false),
+                    (range.end, true),
+                    (snapshot.len(), false),
+                ] {
+                    let cell = CellBuilder::new(next_cell_id.post_inc().clone().into())
+                        .source(cx.new_model(|cx| {
+                            let mut buffer = Buffer::local(
+                                snapshot.text_for_range(start..end).collect::<String>(),
+                                cx,
+                            );
+                            buffer.set_language(notebook.language.clone(), cx);
+                            buffer
+                        }))
+                        .build();
+                    if end == range.end {
+                        notebook
+                            .client_handle
+                            .as_ref()?
+                            .read_with(cx, |client, cx| {
+                                client.run_cell(&cell, cx);
+                            });
+                    };
+                    cells.insert(vec![cell], cx, replace);
+                    start = end;
+                }
+            });
+        });
+
+        // let buffer = editor.buffer().read(cx);
     }
 
     fn insert_cell_above(
@@ -295,6 +350,7 @@ impl Render for NotebookEditor {
             .on_action(cx.listener(NotebookEditor::run_current_cell))
             .on_action(cx.listener(NotebookEditor::insert_cell_above))
             .on_action(cx.listener(NotebookEditor::insert_cell_below))
+            .on_action(cx.listener(NotebookEditor::run_current_selection))
     }
 }
 

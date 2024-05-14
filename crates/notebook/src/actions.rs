@@ -1,3 +1,11 @@
 use gpui::actions;
 
-actions!(notebook, [RunCurrentCell, InsertCellAbove, InsertCellBelow]);
+actions!(
+    notebook,
+    [
+        RunCurrentCell,
+        RunCurrentSelection,
+        InsertCellAbove,
+        InsertCellBelow
+    ]
+);
