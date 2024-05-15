@@ -1,12 +1,11 @@
 use crate::jupyter::message::{IoPubSubMessageType, MessageType};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
-use collections::{HashMap, VecDeque};
+use collections::HashMap;
 use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
-use itertools::{chain, Itertools};
+use itertools::Itertools;
 use language::{Buffer, Capability, File};
-use log::{error, warn};
 use project::Project;
 use rope::Rope;
 use runtimelib::media::MimeType;
@@ -17,7 +16,6 @@ use std::{any::Any, fmt::Debug, path::PathBuf, sync::Arc};
 use sum_tree::{Cursor, Dimension, SumTree, Summary};
 use text::Bias;
 use ui::Context;
-use util::post_inc;
 
 #[derive(Clone, Debug)]
 pub struct Cell {
@@ -59,10 +57,11 @@ impl Cell {
         );
     }
 
-    fn increment_id<C: Context>(&self, cx: &mut C) {
+    fn increment_id<C: Context>(&self, cx: &mut C) -> &Self {
         let incremented_id = self.id.get().pre_inc();
         self.id.set(incremented_id);
         self.update_titles(cx);
+        self
     }
 }
 
@@ -131,7 +130,7 @@ impl CellBuilder {
                         }?;
 
                         project_handle
-                            .update(cx, |project, cx| -> Result<()> {
+                            .update(cx, |_project, cx| -> Result<()> {
                                 let mut source_text = source_lines.join("\n");
                                 source_text.push_str("\n");
                                 let source_buffer =
@@ -346,38 +345,10 @@ impl Cells {
         res
     }
 
-    pub(crate) fn try_replace_with<C: Context, F>(
-        &mut self,
-        cx: &mut C,
-        cell_id: &CellId,
-        f: F,
-    ) -> Result<Cell>
-    where
-        F: FnOnce(&Cell) -> Result<Cell>,
-    {
-        let Some(old_cell) = self.tree.get(cell_id, &()) else {
-            let err = anyhow!("Cannot replace nonexistent cell with ID {:#?}", cell_id);
-            return Err(err);
-        };
-        let new_cell = f(old_cell)?;
-        if new_cell.id != old_cell.id {
-            return Err(anyhow!(
-                "New cell ID (got `{:#?}`) must match old cell ID (got `{:#?}`)",
-                new_cell.id,
-                old_cell.id
-            ));
-        };
-        self.insert(vec![new_cell.clone()], cx, true);
-        self.tree.insert_or_replace(new_cell, &()).ok_or_else(|| {
-            anyhow!("Inserted new cell without replacing old, tree is likely corrupted")
-        })
-    }
-
     pub(crate) fn insert<C: Context>(
         &mut self,
         iterable_cells: impl IntoIterator<Item = Cell>,
         cx: &mut C,
-        replace: bool,
     ) {
         self.multi.update(cx, |multi, cx| {
             let cells_to_insert = SumTree::<Cell>::from_iter(iterable_cells.into_iter(), &());
@@ -401,39 +372,19 @@ impl Cells {
                 })
                 .unwrap_or(ExcerptId::min());
 
-            let mut ids_excerpts_to_remove = Vec::<ExcerptId>::new();
-            if replace {
-                do_in!(|| ids_excerpts_to_remove.extend(
-                    cursor
-                        .slice(&cells_to_insert.last()?.id.get(), Bias::Right, &())
-                        .iter()
-                        .flat_map(|cell| excerpt_ids_for_cell(multi, cell, cx)),
-                ));
-                warn!("{:#?}", ids_excerpts_to_remove);
-            }
+            let (shifted_cells, ids_excerpts_to_remove) = cursor.fold(
+                (Vec::<Cell>::new(), Vec::<ExcerptId>::new()),
+                |(mut cells, mut excerpt_ids), cell| {
+                    excerpt_ids.extend(excerpt_ids_for_cell(multi, &cell, cx));
+                    cells.push(cell.increment_id(cx).clone());
+                    (cells, excerpt_ids)
+                },
+            );
 
-            let mut next_cells: VecDeque<_> = cells_to_insert
-                .iter()
-                .chain(cursor.map(|cell| {
-                    if !replace {
-                        cell.increment_id(cx);
-                    };
-                    cell
-                }))
-                .collect();
-
-            while let Some(next_cell) = next_cells.pop_front() {
-                new_tree.insert_or_replace(next_cell.clone(), &());
-                if next_cell.id.get() <= cells_to_insert.last().unwrap().id.get() {
-                    //
-                } else if replace {
-                    continue;
-                } else {
-                    ids_excerpts_to_remove.extend(excerpt_ids_for_cell(multi, next_cell, cx));
-                }
-                let mut buffers_to_insert = vec![next_cell.source.clone()];
-                do_in!(|| buffers_to_insert.push(next_cell.output_content.as_ref()?.clone()));
-
+            for cell in cells_to_insert.iter().chain(shifted_cells.iter()) {
+                new_tree.insert_or_replace(cell.clone(), &());
+                let mut buffers_to_insert = vec![cell.source.clone()];
+                do_in!(|| buffers_to_insert.push(cell.output_content.as_ref()?.clone()));
                 match insert_as_excerpts_into_multibuffer(
                     buffers_to_insert,
                     prev_excerpt_id.to_proto(),
@@ -467,24 +418,15 @@ impl Cells {
 
         let buffer_handle = match cell.output_content.as_ref() {
             Some(buffer_handle) => buffer_handle.clone(),
-            None => {
-                let buffer_handle = cx.new_model(|cx| Buffer::local("", cx)).into();
-                self.try_replace_with(cx, &cell.id.get(), |cell| {
-                    let mut replacement = cell.clone();
-                    replacement.output_content.replace(buffer_handle.clone());
-                    Ok(replacement)
-                })?;
-                buffer_handle
-            }
+            None => cx.new_model(|cx| Buffer::local("", cx)).into(),
         };
 
-        match msg.msg_type {
+        let mut text: Option<String> = None;
+        match &msg.msg_type {
             MessageType::IoPubSub(io_pubsub_msg_type) => match io_pubsub_msg_type {
                 IoPubSubMessageType::Stream => {
                     do_in!(|| {
-                        let text: String =
-                            serde_json::from_value(msg.content.remove("text")?).ok()?;
-                        buffer_handle.update(cx, |buffer, cx| buffer.set_text(text, cx));
+                        text.replace(serde_json::from_value(msg.content.remove("text")?).ok()?);
                     });
                 }
                 IoPubSubMessageType::ExecutionError => {
@@ -496,15 +438,12 @@ impl Cells {
                         let traceback: Vec<String> =
                             serde_json::from_value(msg.content.remove("traceback")?).ok()?;
 
-                        buffer_handle.update(cx, |buffer, cx| {
-                            let text = format!(
-                                "{}: {}\n{}",
-                                error_name,
-                                error_value,
-                                traceback.join("\n")
-                            );
-                            buffer.set_text(text, cx);
-                        });
+                        text.replace(format!(
+                            "{}: {}\n{}",
+                            error_name,
+                            error_value,
+                            traceback.join("\n")
+                        ));
                     });
                 }
                 // TODO: Remaining PubSub message types
@@ -512,8 +451,28 @@ impl Cells {
             },
             // TODO: Remaining message types where applicable
             _ => {}
+        };
+
+        if text.is_none() {
+            return Ok(());
         }
 
+        let mut updated = cell.clone();
+        updated.output_content.replace(buffer_handle.clone());
+        updated.update_titles(cx); // This changes the file of `buffer_handle`, which updates the tab title
+        if cell.output_content.is_none() {
+            self.multi.update(cx, |multi, cx| {
+                do_in!(|| insert_as_excerpts_into_multibuffer(
+                    vec![buffer_handle.clone()],
+                    excerpt_ids_for_cell(multi, &cell, cx).last()?.to_proto(),
+                    multi,
+                    cx,
+                ));
+            });
+        }
+        buffer_handle.update(cx, |buffer, cx| Some(buffer.set_text(text?, cx)?));
+
+        self.tree.insert_or_replace(updated, &());
         Ok(())
     }
 
@@ -525,7 +484,7 @@ impl Cells {
         let multi = cx.new_model(|_cx| MultiBuffer::new(0, Capability::ReadWrite))?;
         let mut this = Cells { tree, multi };
         let cells_to_insert = builders.into_iter().map(|b| b.build()).collect_vec();
-        this.insert(cells_to_insert, cx, true);
+        this.insert(cells_to_insert, cx);
         Ok(this)
     }
 }
