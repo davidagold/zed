@@ -8,7 +8,7 @@ use gpui::{
 };
 use itertools::Itertools;
 use language::Buffer;
-use log::{error, warn};
+use log::error;
 use project::{self, Project};
 use std::{
     any::{Any, TypeId},
@@ -25,7 +25,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellBuilder, CellId, CellType},
+    cell::{Cell, CellBuilder, CellType},
     do_in,
     kernel::{JupyterKernelClient, KernelEvent},
     Notebook,
@@ -123,20 +123,7 @@ impl NotebookEditor {
                 let response = client_handle.run_cell(&current_cell, cx)?;
                 anyhow::Ok((current_cell, response))
             })
-        })
-        // .and_then(|(mut current_cell, _response)| {
-        //     if current_cell.output_content.is_some() {
-        //         current_cell.output_content = None;
-        //         self.notebook.update(cx, |notebook, cx| {
-        //             notebook
-        //                 .cells
-        //                 // TODO: Update execution count and so on
-        //                 .try_replace_with(cx, &current_cell.id.get(), |_cell| Ok(current_cell))
-        //         })?;
-        //     };
-        //     Ok(())
-        // })
-        {
+        }) {
             error!("{:#?}", err);
         }
     }
@@ -151,7 +138,9 @@ impl NotebookEditor {
             do_in!(|| {
                 let editor = self.editor.read(cx);
                 let (_, buffer_handle, _) = editor.active_excerpt(cx)?;
-                let mut next_cell_id = cells.get_cell_by_buffer(&buffer_handle, cx)?.id.get();
+                let current_cell = cells.get_cell_by_buffer(&buffer_handle, cx)?.clone();
+                let current_cell_id = current_cell.id.get();
+
                 let (_, range, _) = cells
                     .multi
                     .read_with(cx, |multi, cx| {
@@ -162,37 +151,44 @@ impl NotebookEditor {
                     .at_most_one()
                     .ok()??;
                 let snapshot = buffer_handle.read(cx).text_snapshot();
-                let mut start = 0;
-                for (end, replace) in vec![
-                    (range.start, false),
-                    (range.end, true),
-                    (snapshot.len(), false),
-                ] {
-                    let cell = CellBuilder::new(next_cell_id.post_inc().clone().into())
-                        .source(cx.new_model(|cx| {
-                            let mut buffer = Buffer::local(
-                                snapshot.text_for_range(start..end).collect::<String>(),
-                                cx,
-                            );
+
+                let buffers_with_range_by_offset = vec![0..range.start, range.end..snapshot.len()]
+                    .into_iter()
+                    .map(|range| {
+                        let text = snapshot.text_for_range(range.clone()).collect::<String>();
+                        (text, range)
+                    })
+                    .map(|(text, range)| {
+                        let buffer = cx.new_model(|cx| {
+                            let mut buffer = Buffer::local(text, cx);
                             buffer.set_language(notebook.language.clone(), cx);
                             buffer
-                        }))
+                        });
+                        (buffer, range)
+                    })
+                    .zip(vec![0, 2])
+                    .collect_vec();
+
+                current_cell.source.update(cx, |buffer, cx| {
+                    let edits = buffers_with_range_by_offset
+                        .iter()
+                        .map(|((_, range), _)| (range.clone(), ""));
+                    buffer.edit(edits, None, cx);
+                });
+
+                for ((buffer, _), id_offset) in buffers_with_range_by_offset {
+                    let cell = CellBuilder::new(u64::from(current_cell_id) + id_offset as u64)
+                        .source(buffer)
                         .build();
-                    if end == range.end {
-                        notebook
-                            .client_handle
-                            .as_ref()?
-                            .read_with(cx, |client, cx| {
-                                client.run_cell(&cell, cx);
-                            });
-                    };
-                    cells.insert(vec![cell], cx, replace);
-                    start = end;
+                    cells.insert(vec![cell], cx);
                 }
+
+                let _ = notebook
+                    .client_handle
+                    .as_ref()?
+                    .read_with(cx, |client, cx| client.run_cell(&current_cell, cx));
             });
         });
-
-        // let buffer = editor.buffer().read(cx);
     }
 
     fn insert_cell_above(
@@ -234,7 +230,7 @@ impl NotebookEditor {
                     }
                     _ => {}
                 }
-                notebook.cells.insert(vec![cell], cx, false);
+                notebook.cells.insert(vec![cell], cx);
             });
         });
     }
