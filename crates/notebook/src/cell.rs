@@ -1,4 +1,4 @@
-use crate::jupyter::message::{IoPubSubMessageType, MessageType};
+use crate::jupyter::message::{IoPubSubMessageContent, IoPubSubMessageType, MessageType};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
@@ -23,6 +23,7 @@ pub struct Cell {
     // The `msg_id` of the latest `execute_request` message sent to request the execution of the present cell
     pub(crate) latest_execution_request_msg_id: Option<String>,
     pub(crate) text_summary: TextSummary,
+    pub(crate) history: HashMap<String, Vec<Message>>,
 
     // `cell_id` is a notebook field, whereas `cell.id` is the `KeyedItem` associated type  for a `SumTree<Cell>`
     pub cell_id: Option<String>,
@@ -35,13 +36,14 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub(crate) fn update_titles<C: Context>(&self, cx: &mut C) {
+    pub(crate) fn update_titles<C: Context>(&self, mark_success: bool, cx: &mut C) {
         cx.update_model(&self.source, |buffer, cx| {
             let title = title_for_cell_excerpt(
                 self.id.get().into(),
                 self.cell_id.as_ref(),
                 &self.cell_type,
                 false,
+                mark_success,
             );
             buffer.file_updated(Arc::new(title), cx);
         });
@@ -52,6 +54,7 @@ impl Cell {
                     self.cell_id.as_ref(),
                     &self.cell_type,
                     true,
+                    mark_success,
                 );
                 buffer.file_updated(Arc::new(title), cx);
             })
@@ -61,7 +64,7 @@ impl Cell {
     fn increment_id<C: Context>(&self, cx: &mut C) -> &Self {
         let incremented_id = self.id.get().pre_inc();
         self.id.set(incremented_id);
-        self.update_titles(cx);
+        self.update_titles(false, cx);
         self
     }
 
@@ -183,6 +186,7 @@ impl CellBuilder {
                                     self.cell_id.as_ref(),
                                     self.cell_type.as_ref().unwrap_or(&CellType::Raw),
                                     true,
+                                    false,
                                 );
                                 OutputHandler::try_as_buffer(outputs.iter(), title, cx)
                             }
@@ -195,8 +199,13 @@ impl CellBuilder {
                 let cell_id = self.cell_id.clone();
                 let cell_type = self.cell_type.clone();
                 do_in!(|| -> Option<_> {
-                    let title =
-                        title_for_cell_excerpt(self.id, (&cell_id).as_ref(), &cell_type?, false);
+                    let title = title_for_cell_excerpt(
+                        self.id,
+                        (&cell_id).as_ref(),
+                        &cell_type?,
+                        false,
+                        false,
+                    );
                     if let Some(buffer_handle) = &self.source {
                         cx.update_model(&buffer_handle, |buffer, cx| {
                             buffer.file_updated(Arc::new(title), cx);
@@ -225,6 +234,7 @@ impl CellBuilder {
         let mut cell = Cell {
             id: CellId(self.id).into(),
             latest_execution_request_msg_id: None,
+            history: HashMap::<String, Vec<Message>>::default(),
             text_summary: self.text_summary.unwrap_or_else(|| TextSummary::from("")),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap_or_default(),
@@ -375,6 +385,37 @@ impl Cells {
         res
     }
 
+    pub(crate) fn replace<C: Context>(&mut self, cell: Cell, cx: &mut C) {
+        self.multi.update(cx, |multi, cx| {
+            let Some(current_cell) = self.get_cell_by_id(&cell.id.get()) else {
+                return;
+            };
+            let ids_excerpts_to_remove = excerpt_ids_for_cell(multi, current_cell, cx);
+            let mut cursor = self.tree.cursor::<CellId>();
+            cursor.seek(&cell.id.get(), Bias::Left, &());
+            do_in!(|| {
+                let prev_excerpt_id = cursor
+                    .prev_item()
+                    .and_then(|prev_cell| {
+                        excerpt_ids_for_cell(multi, prev_cell, cx)
+                            .into_iter()
+                            .last()
+                    })
+                    .unwrap_or(ExcerptId::min());
+                insert_as_excerpts_into_multibuffer(
+                    cell.buffer_handles()
+                        .into_iter()
+                        .map(Model::<Buffer>::clone),
+                    prev_excerpt_id.to_proto(),
+                    multi,
+                    cx,
+                )
+            });
+            multi.remove_excerpts(ids_excerpts_to_remove, cx);
+        });
+        self.tree.insert_or_replace(cell, &());
+    }
+
     pub(crate) fn insert<C: Context>(
         &mut self,
         iterable_cells: impl IntoIterator<Item = Cell>,
@@ -386,7 +427,7 @@ impl Cells {
                 return Err(anyhow!("No cells to insert"));
             };
             for cell in cells_to_insert.iter() {
-                cell.update_titles(cx);
+                cell.update_titles(false, cx);
             }
             let id_first_to_insert = cells_to_insert.first().unwrap().id.get();
 
@@ -399,9 +440,6 @@ impl Cells {
                     excerpt_ids_for_cell(multi, prev_cell, cx)
                         .into_iter()
                         .last()
-                    // .into_iter()
-                    // .map(|(id, _)| id)
-                    // .last()
                 })
                 .unwrap_or(ExcerptId::min());
 
@@ -445,21 +483,83 @@ impl Cells {
     where
         C::Result<Model<Buffer>>: Into<Model<Buffer>>,
     {
-        let Some(cell) = self.get_cell_by_id(cell_id) else {
+        let Some(mut cell) = self.get_cell_by_id(cell_id).cloned() else {
             return Err(anyhow!("No cell with cell ID {:#?}", cell_id));
         };
+        let parent_msg_id = &msg.parent_header.msg_id;
+        if !cell.history.contains_key(parent_msg_id) {
+            cell.history
+                .insert(parent_msg_id.clone(), Vec::<Message>::new());
+        };
+        do_in!(|| cell.history.get_mut(parent_msg_id)?.push(msg.clone()));
 
-        let buffer_handle = match cell.output_content.as_ref() {
-            Some(buffer_handle) => buffer_handle.clone(),
-            None => cx.new_model(|cx| Buffer::local("", cx)).into(),
+        let buffer_handle = match (
+            cell.output_content.as_ref(),
+            Some(parent_msg_id) == cell.latest_execution_request_msg_id.as_ref(),
+        ) {
+            (Some(buffer_handle), true) => buffer_handle.clone(),
+            _ => cx.new_model(|cx| Buffer::local("", cx)).into(),
         };
 
-        let mut text: Option<String> = None;
         match &msg.msg_type {
             MessageType::IoPubSub(io_pubsub_msg_type) => match io_pubsub_msg_type {
                 IoPubSubMessageType::Stream => {
+                    buffer_handle.update(cx, |buffer, cx| {
+                        do_in!(|| -> Result<()> {
+                            let mut extant_text = buffer.as_rope().clone();
+                            use IoPubSubMessageContent::*;
+                            match serde_json::from_value::<IoPubSubMessageContent>(
+                                serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
+                            )? {
+                                Stream { name: _name, text } => {
+                                    extant_text.append(Rope::from(text));
+                                    buffer.set_text(extant_text.to_string(), cx);
+                                }
+                                _ => {
+                                    let err = anyhow!(
+                                        "Failed to deserialize content: {:#?}",
+                                        msg.content
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                            anyhow::Ok(())
+                        })
+                    });
+                    cell.output_content.replace(buffer_handle);
+                }
+                IoPubSubMessageType::ExecuteResult => {
                     do_in!(|| {
-                        text.replace(serde_json::from_value(msg.content.remove("text")?).ok()?);
+                        match serde_json::from_value::<IoPubSubMessageContent>(
+                            serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
+                        )
+                        .ok()?
+                        {
+                            IoPubSubMessageContent::ExecutionResult {
+                                data,
+                                metadata: _metadata,
+                                execution_count: _execution_count,
+                            } => {
+                                use MimeData::*;
+                                use MimeType::*;
+                                for (mime_type, mime_data) in data {
+                                    match (mime_type, mime_data) {
+                                        (Plain, Text(text)) => {
+                                            buffer_handle
+                                                .update(cx, |buffer, cx| buffer.set_text(text, cx));
+                                        }
+                                        (Plain, MultiLineText(lines)) => {
+                                            buffer_handle.update(cx, |buffer, cx| {
+                                                buffer.set_text(lines.join("\n"), cx)
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                cell.output_content.replace(buffer_handle);
+                            }
+                            _ => {}
+                        }
                     });
                 }
                 IoPubSubMessageType::ExecutionError => {
@@ -471,42 +571,44 @@ impl Cells {
                         let traceback: Vec<String> =
                             serde_json::from_value(msg.content.remove("traceback")?).ok()?;
 
-                        text.replace(format!(
-                            "{}: {}\n{}",
-                            error_name,
-                            error_value,
-                            traceback.join("\n")
-                        ));
+                        let text =
+                            format!("{}: {}\n{}", error_name, error_value, traceback.join("\n"));
+                        buffer_handle.update(cx, |buffer, cx| buffer.set_text(text, cx));
+                        cell.output_content.replace(buffer_handle);
                     });
                 }
+                IoPubSubMessageType::KernelStatus => {
+                    do_in!(|| {
+                        match msg.content.get("execution_state")?.as_str() {
+                            Some("idle") => {
+                                let messages = cell.history.get(&msg.parent_header.msg_id)?;
+                                if !messages.iter().any(|msg| match msg.msg_type {
+                                    MessageType::IoPubSub(IoPubSubMessageType::ExecutionError) => {
+                                        true
+                                    }
+                                    _ => false,
+                                }) {
+                                    cell.update_titles(true, cx);
+                                    self.replace(cell, cx);
+                                }
+                            }
+                            _ => {}
+                        };
+                    });
+                    return Ok(());
+                }
                 // TODO: Remaining PubSub message types
-                _ => {}
+                _ => return Ok(()),
             },
             // TODO: Remaining message types where applicable
-            _ => {}
+            _ => return Ok(()),
         };
 
-        if text.is_none() {
-            return Ok(());
-        }
+        // log::warn!("{:#?}", msg.msg_type);
+        cell.update_titles(false, cx); // This changes the file of `buffer_handle`, which updates the tab title, so we update before inserting
+        cell.update_text_summary(cx);
+        self.replace(cell, cx);
 
-        let mut updated = cell.clone();
-        updated.output_content.replace(buffer_handle.clone());
-        updated.update_titles(cx); // This changes the file of `buffer_handle`, which updates the tab title, so we update before inserting
-        updated.update_text_summary(cx);
-        if cell.output_content.is_none() {
-            self.multi.update(cx, |multi, cx| {
-                do_in!(|| insert_as_excerpts_into_multibuffer(
-                    vec![buffer_handle.clone()],
-                    excerpt_ids_for_cell(multi, &cell, cx).last()?.to_proto(),
-                    multi,
-                    cx,
-                ));
-            });
-        }
-        buffer_handle.update(cx, |buffer, cx| Some(buffer.set_text(text?, cx)?));
-
-        self.tree.insert_or_replace(updated, &());
         Ok(())
     }
 
@@ -542,7 +644,6 @@ impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
     fn summary(&self) -> Self::Summary {
-        // do_in!(|| buffer_handles.push(self.output_content.as_ref()?));
         let mut text_summary = self.text_summary.clone();
         text_summary.lines.row += 1;
         CellSummary {
@@ -582,7 +683,7 @@ impl<'a> sum_tree::SeekTarget<'a, CellSummary, CellSummary> for CellId {
     fn cmp(
         &self,
         cursor_location: &CellSummary,
-        cx: &<CellSummary as Summary>::Context,
+        _cx: &<CellSummary as Summary>::Context,
     ) -> std::cmp::Ordering {
         Ord::cmp(&(*self).into(), &cursor_location.num_cells_inclusive)
     }
@@ -605,6 +706,10 @@ impl From<CellId> for u64 {
 }
 
 impl CellId {
+    fn prior(&self) -> CellId {
+        u64::from(self.clone()).saturating_sub(1).into()
+    }
+
     pub(crate) fn min() -> CellId {
         CellId(0)
     }
@@ -654,6 +759,7 @@ pub enum IpynbCodeOutput {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum MimeData {
+    Text(String),
     MultiLineText(Vec<String>),
     B64EncodedMultiLineText(Vec<String>),
     Json(HashMap<String, serde_json::Value>),
@@ -830,18 +936,19 @@ pub(crate) fn title_for_cell_excerpt(
     cell_id: Option<&String>,
     cell_type: &CellType,
     for_output: bool,
+    mark_success: bool,
 ) -> PhonyFile {
-    let path_buf: PathBuf = match for_output {
-        false => [format!("Cell {idx}"), format!("({:#?})  ", cell_type)]
-            .iter()
-            .rev()
-            .map(|s| s.as_str())
-            .collect(),
-        true => [format!("[Output — Cell {:#?}]", idx)]
-            .iter()
-            .map(|s| s.as_str())
-            .collect(),
+    let path_iter = match (for_output, mark_success) {
+        (false, true) => vec![
+            format!("({:#?})  ", cell_type),
+            "✓".into(),
+            format!("Cell {idx}"),
+        ]
+        .into_iter(),
+        (false, false) => vec![format!("({:#?})  ", cell_type), format!("Cell {idx}")].into_iter(),
+        (true, _) => vec![format!("[Output — Cell {:#?}]", idx)].into_iter(),
     };
+    let path_buf: PathBuf = path_iter.collect();
     PhonyFile {
         worktree_id: 0,
         title: Arc::from(path_buf.as_path()),
