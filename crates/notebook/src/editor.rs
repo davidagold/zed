@@ -20,7 +20,6 @@ use ui::{
     div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
     Render, SharedString, Styled, ViewContext, VisualContext,
 };
-
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
@@ -256,7 +255,7 @@ impl NotebookEditor {
                 .lines;
             point.column = 0;
             drop(cursor);
-            editor.change_selections(Some(Autoscroll::center()), cx, |s| {
+            editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                 s.select_ranges([point..point])
             });
         });
