@@ -7,7 +7,7 @@ use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel}
 use itertools::Itertools;
 use language::{Buffer, Capability, File};
 use project::Project;
-use rope::Rope;
+use rope::{Rope, TextSummary};
 use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
@@ -22,6 +22,7 @@ pub struct Cell {
     pub id: StdCell<CellId>,
     // The `msg_id` of the latest `execute_request` message sent to request the execution of the present cell
     pub(crate) latest_execution_request_msg_id: Option<String>,
+    pub(crate) text_summary: TextSummary,
 
     // `cell_id` is a notebook field, whereas `cell.id` is the `KeyedItem` associated type  for a `SumTree<Cell>`
     pub cell_id: Option<String>,
@@ -63,11 +64,31 @@ impl Cell {
         self.update_titles(cx);
         self
     }
+
+    pub(crate) fn update_text_summary<C: Context>(&mut self, cx: &C) {
+        // let mut buffer_handles = vec![&self.source];
+        self.source.read_with(cx, |buffer, cx| {
+            self.text_summary = buffer.text_snapshot().text_summary();
+        });
+        if let Some(buffer_handle) = &self.output_content {
+            buffer_handle.read_with(cx, |buffer, cx| {
+                self.text_summary += buffer.text_summary();
+                self.text_summary.lines.row += 1;
+            });
+        };
+    }
+
+    pub(crate) fn buffer_handles(&self) -> Vec<&Model<Buffer>> {
+        let mut buffer_handles = vec![&self.source];
+        do_in!(|| buffer_handles.push(self.output_content.as_ref()?));
+        buffer_handles
+    }
 }
 
 #[derive(Default)]
 pub struct CellBuilder {
     id: u64,
+    text_summary: Option<TextSummary>,
     cell_id: Option<String>,
     cell_type: Option<CellType>,
     metadata: Option<HashMap<String, serde_json::Value>>,
@@ -129,10 +150,12 @@ impl CellBuilder {
                             _ => Err(anyhow!("Unexpected source format: {:#?}", val)),
                         }?;
 
+                        let mut source_text = source_lines.join("\n");
+                        source_text.push_str("\n");
+                        self.text_summary = Some(TextSummary::from(source_text.as_str()));
+
                         project_handle
                             .update(cx, |_project, cx| -> Result<()> {
-                                let mut source_text = source_lines.join("\n");
-                                source_text.push_str("\n");
                                 let source_buffer =
                                     cx.new_model(|cx| Buffer::local(source_text, cx));
                                 self.source.replace(source_buffer);
@@ -164,7 +187,7 @@ impl CellBuilder {
                                 OutputHandler::try_as_buffer(outputs.iter(), title, cx)
                             }
                             None => None,
-                        }
+                        };
                     }
                     _ => {}
                 };
@@ -198,10 +221,11 @@ impl CellBuilder {
         self
     }
 
-    pub fn build(self) -> Cell {
-        Cell {
+    pub fn build<C: Context>(self, cx: &mut C) -> Cell {
+        let mut cell = Cell {
             id: CellId(self.id).into(),
             latest_execution_request_msg_id: None,
+            text_summary: self.text_summary.unwrap_or_else(|| TextSummary::from("")),
             cell_id: self.cell_id,
             cell_type: self.cell_type.unwrap_or_default(),
             metadata: self.metadata.unwrap_or_default(),
@@ -209,7 +233,9 @@ impl CellBuilder {
             execution_count: self.execution_count,
             outputs: self.outputs,
             output_content: self.output_content,
-        }
+        };
+        cell.update_text_summary(cx);
+        cell
     }
 }
 
@@ -283,18 +309,22 @@ pub(crate) fn insert_as_excerpts_into_multibuffer(
     Ok(id_last_excerpt_added)
 }
 
-fn excerpt_ids_for_cell(
+pub(crate) fn excerpt_ids_for_cell(
     multi: &MultiBuffer,
     cell: &Cell,
-    cx: &ModelContext<MultiBuffer>,
+    cx: &AppContext,
 ) -> Vec<ExcerptId> {
     let mut excerpt_ids = Vec::<ExcerptId>::new();
     let mut buffers = vec![&cell.source];
     do_in!(|| buffers.push(cell.output_content.as_ref()?));
     for buffer in buffers {
-        let (inner_excerpt_ids, _): (Vec<_>, Vec<_>) =
-            multi.excerpts_for_buffer(buffer, cx).into_iter().unzip();
-        excerpt_ids.extend(inner_excerpt_ids);
+        excerpt_ids.extend(
+            multi
+                .excerpts_for_buffer(buffer, cx)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect_vec(),
+        );
     }
     excerpt_ids
 }
@@ -369,6 +399,9 @@ impl Cells {
                     excerpt_ids_for_cell(multi, prev_cell, cx)
                         .into_iter()
                         .last()
+                    // .into_iter()
+                    // .map(|(id, _)| id)
+                    // .last()
                 })
                 .unwrap_or(ExcerptId::min());
 
@@ -459,7 +492,8 @@ impl Cells {
 
         let mut updated = cell.clone();
         updated.output_content.replace(buffer_handle.clone());
-        updated.update_titles(cx); // This changes the file of `buffer_handle`, which updates the tab title
+        updated.update_titles(cx); // This changes the file of `buffer_handle`, which updates the tab title, so we update before inserting
+        updated.update_text_summary(cx);
         if cell.output_content.is_none() {
             self.multi.update(cx, |multi, cx| {
                 do_in!(|| insert_as_excerpts_into_multibuffer(
@@ -483,7 +517,7 @@ impl Cells {
         let tree = SumTree::<Cell>::new();
         let multi = cx.new_model(|_cx| MultiBuffer::new(0, Capability::ReadWrite))?;
         let mut this = Cells { tree, multi };
-        let cells_to_insert = builders.into_iter().map(|b| b.build()).collect_vec();
+        let cells_to_insert = builders.into_iter().map(|b| b.build(cx)).collect_vec();
         this.insert(cells_to_insert, cx);
         Ok(this)
     }
@@ -492,6 +526,7 @@ impl Cells {
 #[derive(Clone, Debug, Default)]
 pub struct CellSummary {
     num_cells_inclusive: u64,
+    pub(crate) text_summary: TextSummary,
 }
 
 impl Summary for CellSummary {
@@ -499,6 +534,7 @@ impl Summary for CellSummary {
 
     fn add_summary(&mut self, summary: &Self, _cx: &Self::Context) {
         self.num_cells_inclusive += summary.num_cells_inclusive;
+        self.text_summary += &summary.text_summary;
     }
 }
 
@@ -506,8 +542,12 @@ impl sum_tree::Item for Cell {
     type Summary = CellSummary;
 
     fn summary(&self) -> Self::Summary {
+        // do_in!(|| buffer_handles.push(self.output_content.as_ref()?));
+        let mut text_summary = self.text_summary.clone();
+        text_summary.lines.row += 1;
         CellSummary {
             num_cells_inclusive: 1,
+            text_summary,
         }
     }
 }
@@ -526,6 +566,15 @@ impl<'a> Dimension<'a, CellSummary> for CellId {
     }
     fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
         CellId::from(summary.num_cells_inclusive)
+    }
+}
+
+impl<'a> Dimension<'a, CellSummary> for TextSummary {
+    fn add_summary(&mut self, summary: &'a CellSummary, _: &<CellSummary as Summary>::Context) {
+        *self += &summary.text_summary;
+    }
+    fn from_summary(summary: &'a CellSummary, cx: &<CellSummary as Summary>::Context) -> Self {
+        summary.text_summary.clone()
     }
 }
 
@@ -556,6 +605,10 @@ impl From<CellId> for u64 {
 }
 
 impl CellId {
+    pub(crate) fn min() -> CellId {
+        CellId(0)
+    }
+
     pub(crate) fn pre_inc(&mut self) -> Self {
         self.0 += 1;
         *self
