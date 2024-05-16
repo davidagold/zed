@@ -120,7 +120,7 @@ pub enum ShellMessageType {
     KernelInfoReply,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum IoPubSubMessageType {
     #[serde(rename = "stream")]
     Stream,
@@ -143,6 +143,7 @@ pub enum IoPubSubMessageType {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
 pub enum IoPubSubMessageContent {
     #[serde(alias = "stream")]
     Stream {
