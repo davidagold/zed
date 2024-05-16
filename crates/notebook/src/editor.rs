@@ -1,15 +1,16 @@
 //! Jupyter support for Zed.
 
-use anyhow::anyhow;
-use editor::{items::entry_label_color, Editor, EditorEvent, MAX_TAB_TITLE_LEN};
+use editor::{
+    items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MAX_TAB_TITLE_LEN,
+};
 use gpui::{
     AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
 use itertools::Itertools;
 use language::Buffer;
-use log::error;
 use project::{self, Project};
+use rope::{Point, TextSummary};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
@@ -25,9 +26,9 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions,
-    cell::{Cell, CellBuilder, CellType},
+    cell::{Cell, CellBuilder, CellId, CellType},
     do_in,
-    kernel::{JupyterKernelClient, KernelEvent},
+    kernel::KernelEvent,
     Notebook,
 };
 
@@ -61,22 +62,24 @@ impl NotebookEditor {
         })
         .detach();
 
-        // TODO: Figure out what goes here.
-        // cx.on_focus_out(&focus_handle, |this, cx| {})
-        // .detach();
-        //
         let mut subscriptions = Vec::<Subscription>::new();
 
         subscriptions.push(cx.subscribe(&project, |_this, _project, event, _cx| {
             log::info!("Event: {:#?}", event);
         }));
         subscriptions.push(
-            cx.subscribe(&editor, |_this, _editor, event: &EditorEvent, cx| {
+            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
                 cx.emit(event.clone());
                 match event {
                     EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
-                    EditorEvent::TitleChanged => {
-                        cx.notify();
+                    EditorEvent::BufferEdited => {
+                        do_in!(|| {
+                            let mut active_cell = this.active_cell(cx)?.clone();
+                            active_cell.update_text_summary(cx);
+                            this.notebook.update(cx, |notebook, cx| {
+                                notebook.cells.tree.insert_or_replace(active_cell, &());
+                            });
+                        });
                     }
                     _ => {}
                 }
@@ -105,27 +108,29 @@ impl NotebookEditor {
         }
     }
 
-    fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) -> () {
+    pub fn active_cell<'cell, 'cx: 'cell>(&self, cx: &'cx AppContext) -> Option<&'cell Cell> {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
-            return ();
+            return None;
         };
-        if let Err(err) = self.notebook.read_with(cx, |notebook, cx| {
-            do_in!(|| -> Option<(Cell, &JupyterKernelClient)> {
-                let current_cell = notebook
-                    .cells
-                    .get_cell_by_buffer(&buffer_handle, cx)?
-                    .clone();
-                let client_handle = notebook.client_handle.as_ref()?.read(cx);
-                Some((current_cell, client_handle))
-            })
-            .ok_or_else(|| anyhow!("Failed to get current cell or client handle"))
-            .and_then(|(current_cell, client_handle)| {
-                let response = client_handle.run_cell(&current_cell, cx)?;
-                anyhow::Ok((current_cell, response))
-            })
-        }) {
-            error!("{:#?}", err);
-        }
+        self.notebook
+            .read(cx)
+            .cells
+            .get_cell_by_buffer(&buffer_handle, cx)
+    }
+
+    fn run_current_cell(&mut self, _: &actions::RunCurrentCell, cx: &mut ViewContext<Self>) -> () {
+        do_in!(|| {
+            let current_cell = self.active_cell(cx)?.clone();
+            let next_cell_id = current_cell.id.get().pre_inc();
+            self.focus_cell(&next_cell_id, None, cx);
+            self.notebook
+                .read(cx)
+                .client_handle
+                .as_ref()?
+                .read(cx)
+                .run_cell(&current_cell, cx);
+            current_cell.id.get().pre_inc()
+        });
     }
 
     fn run_current_selection(
@@ -179,7 +184,7 @@ impl NotebookEditor {
                 for ((buffer, _), id_offset) in buffers_with_range_by_offset {
                     let cell = CellBuilder::new(u64::from(current_cell_id) + id_offset as u64)
                         .source(buffer)
-                        .build();
+                        .build(cx);
                     cells.insert(vec![cell], cx);
                 }
 
@@ -222,7 +227,9 @@ impl NotebookEditor {
                 Bias::Right => current_cell_id.pre_inc(),
             };
             let source = cx.new_model(|cx| Buffer::local("", cx));
-            let cell = CellBuilder::new(new_cell_id.into()).source(source).build();
+            let cell = CellBuilder::new(new_cell_id.clone().into())
+                .source(source)
+                .build(cx);
             let _ = self.notebook.update(cx, |notebook, cx| {
                 match cell.cell_type {
                     CellType::Code => {
@@ -231,6 +238,26 @@ impl NotebookEditor {
                     _ => {}
                 }
                 notebook.cells.insert(vec![cell], cx);
+                cx.notify();
+            });
+            self.focus_cell(&new_cell_id, None, cx);
+        });
+    }
+
+    fn focus_cell<C: VisualContext>(&mut self, cell_id: &CellId, point: Option<Point>, cx: &mut C) {
+        self.editor.update(cx, |editor, cx| {
+            let Some(cell) = self.notebook.read(cx).cells.get_cell_by_id(cell_id).clone() else {
+                return;
+            };
+            let notebook = self.notebook.read(cx);
+            let mut cursor = notebook.cells.cursor::<CellId>();
+            let mut point = cursor
+                .summary::<CellId, TextSummary>(&cell.id.get(), Bias::Left, &())
+                .lines;
+            point.column = 0;
+            drop(cursor);
+            editor.change_selections(Some(Autoscroll::center()), cx, |s| {
+                s.select_ranges([point..point])
             });
         });
     }
