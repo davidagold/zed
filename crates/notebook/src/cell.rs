@@ -1,4 +1,7 @@
-use crate::jupyter::message::{IoPubSubMessageContent, IoPubSubMessageType, MessageType};
+use crate::jupyter;
+use crate::jupyter::message::{
+    self, ExecutionState, IoPubSubMessageContent, IoPubSubMessageType, MessageType, MimeData,
+};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
@@ -6,6 +9,8 @@ use editor::{ExcerptId, ExcerptRange, MultiBuffer};
 use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel};
 use itertools::Itertools;
 use language::{Buffer, Capability, File};
+use log::error;
+use log::warn;
 use project::Project;
 use rope::{Rope, TextSummary};
 use runtimelib::media::MimeType;
@@ -85,6 +90,15 @@ impl Cell {
         let mut buffer_handles = vec![&self.source];
         do_in!(|| buffer_handles.push(self.output_content.as_ref()?));
         buffer_handles
+    }
+
+    pub(crate) fn execution_did_error(&self, msg_id: &String) -> Option<bool> {
+        let messages = self.history.get(msg_id)?;
+        let did_error = messages.iter().any(|msg| match msg.msg_type {
+            MessageType::IoPubSub(IoPubSubMessageType::ExecutionError) => true,
+            _ => false,
+        });
+        Some(did_error)
     }
 }
 
@@ -477,7 +491,7 @@ impl Cells {
     pub(crate) fn update_cell_from_msg<C: Context>(
         &mut self,
         cell_id: &CellId,
-        mut msg: Message,
+        msg: Message,
         cx: &mut C,
     ) -> Result<()>
     where
@@ -502,113 +516,73 @@ impl Cells {
         };
 
         match &msg.msg_type {
-            MessageType::IoPubSub(io_pubsub_msg_type) => match io_pubsub_msg_type {
-                IoPubSubMessageType::Stream => {
-                    buffer_handle.update(cx, |buffer, cx| {
-                        do_in!(|| -> Result<()> {
-                            let mut extant_text = buffer.as_rope().clone();
-                            use IoPubSubMessageContent::*;
-                            match serde_json::from_value::<IoPubSubMessageContent>(
-                                serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
-                            )? {
-                                Stream { name: _name, text } => {
-                                    extant_text.append(Rope::from(text));
-                                    buffer.set_text(extant_text.to_string(), cx);
-                                }
-                                _ => {
-                                    let err = anyhow!(
-                                        "Failed to deserialize content: {:#?}",
-                                        msg.content
-                                    );
-                                    return Err(err);
-                                }
-                            }
-                            anyhow::Ok(())
-                        })
-                    });
-                    cell.output_content.replace(buffer_handle);
-                }
-                IoPubSubMessageType::ExecuteResult => {
-                    do_in!(|| {
-                        match serde_json::from_value::<IoPubSubMessageContent>(
-                            serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
-                        )
-                        .ok()?
-                        {
-                            IoPubSubMessageContent::ExecutionResult {
-                                data,
-                                metadata: _metadata,
-                                execution_count: _execution_count,
-                            } => {
-                                use MimeData::*;
-                                use MimeType::*;
-                                for (mime_type, mime_data) in data {
-                                    match (mime_type, mime_data) {
-                                        (Plain, Text(text)) => {
-                                            buffer_handle
-                                                .update(cx, |buffer, cx| buffer.set_text(text, cx));
-                                        }
-                                        (Plain, MultiLineText(lines)) => {
-                                            buffer_handle.update(cx, |buffer, cx| {
-                                                buffer.set_text(lines.join("\n"), cx)
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                cell.output_content.replace(buffer_handle);
-                            }
-                            _ => {}
-                        }
-                    });
-                }
-                IoPubSubMessageType::ExecutionError => {
-                    do_in!(|| {
-                        let error_name: String =
-                            serde_json::from_value(msg.content.remove("ename")?).ok()?;
-                        let error_value: String =
-                            serde_json::from_value(msg.content.remove("evalue")?).ok()?;
-                        let traceback: Vec<String> =
-                            serde_json::from_value(msg.content.remove("traceback")?).ok()?;
+            MessageType::IoPubSub(io_pubsub_msg_type) => do_in!(|| {
+                use IoPubSubMessageContent::*;
+                use IoPubSubMessageType::*;
 
-                        let text =
-                            format!("{}: {}\n{}", error_name, error_value, traceback.join("\n"));
-                        buffer_handle.update(cx, |buffer, cx| buffer.set_text(text, cx));
+                warn!("{:#?}", msg.content);
+                let content = match serde_json::from_value::<IoPubSubMessageContent>(
+                    serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
+                ) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        error!("{:#?}", err);
+                        return None;
+                    }
+                };
+
+                match (io_pubsub_msg_type, &content) {
+                    (Stream, IoPubSubMessageContent::Stream { name: _name, text }) => {
+                        buffer_handle.update(cx, |buffer, cx| {
+                            let mut extant_text = buffer.as_rope().clone();
+                            extant_text.append(Rope::from(text.clone()));
+                            buffer.set_text(extant_text.to_string(), cx);
+                        });
                         cell.output_content.replace(buffer_handle);
-                    });
-                }
-                IoPubSubMessageType::KernelStatus => {
-                    do_in!(|| {
-                        match msg.content.get("execution_state")?.as_str() {
-                            Some("idle") => {
-                                let messages = cell.history.get(&msg.parent_header.msg_id)?;
-                                if !messages.iter().any(|msg| match msg.msg_type {
-                                    MessageType::IoPubSub(IoPubSubMessageType::ExecutionError) => {
-                                        true
-                                    }
-                                    _ => false,
-                                }) {
-                                    cell.update_titles(true, cx);
-                                    self.replace(cell, cx);
+                        cell.update_titles(false, cx);
+                    }
+                    (ExecuteResult, ExecutionResult { data, .. }) => {
+                        use MimeType::*;
+                        for (mime_type, mime_data) in data {
+                            match (mime_type, mime_data) {
+                                (Plain, MimeData::PlainText(text)) => {
+                                    let text = text.to_string();
+                                    buffer_handle
+                                        .update(cx, |buffer, cx| buffer.set_text(text, cx));
                                 }
+                                _ => {}
                             }
-                            _ => {}
+                        }
+                        cell.output_content.replace(buffer_handle);
+                        cell.update_titles(false, cx);
+                    }
+                    (ExecutionError, Error { .. }) => {
+                        buffer_handle.update(cx, |buffer, cx| {
+                            buffer.set_text(content.error_string()?, cx)
+                        });
+                        cell.output_content.replace(buffer_handle);
+                    }
+                    (
+                        KernelStatus,
+                        ExecutionState {
+                            state: jupyter::message::ExecutionState::Idle,
+                        },
+                    ) => {
+                        if !cell.execution_did_error(&msg.parent_header.msg_id)? {
+                            cell.update_titles(true, cx);
                         };
-                    });
-                    return Ok(());
-                }
-                // TODO: Remaining PubSub message types
-                _ => return Ok(()),
-            },
+                    }
+                    // TODO: Remaining PubSub message types
+                    _ => {}
+                };
+            })
+            .ok_or_else(|| anyhow!("Failed to handle message content"))?,
             // TODO: Remaining message types where applicable
             _ => return Ok(()),
         };
 
-        // log::warn!("{:#?}", msg.msg_type);
-        cell.update_titles(false, cx); // This changes the file of `buffer_handle`, which updates the tab title, so we update before inserting
         cell.update_text_summary(cx);
         self.replace(cell, cx);
-
         Ok(())
     }
 
@@ -753,16 +727,6 @@ pub enum IpynbCodeOutput {
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
     },
-}
-
-// https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MimeData {
-    Text(String),
-    MultiLineText(Vec<String>),
-    B64EncodedMultiLineText(Vec<String>),
-    Json(HashMap<String, serde_json::Value>),
 }
 
 // TODO: Appropriate deserialize from string value

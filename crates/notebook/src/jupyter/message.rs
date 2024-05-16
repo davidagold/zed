@@ -7,7 +7,7 @@ use serde::{
 };
 use serde_json::Value;
 
-use crate::cell::{MimeData, StreamOutputTarget};
+use crate::cell::StreamOutputTarget;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Message {
@@ -167,4 +167,69 @@ pub enum IoPubSubMessageContent {
         data: HashMap<MimeType, MimeData>,
         metadata: HashMap<MimeType, Value>,
     },
+    Error {
+        #[serde(alias = "ename")]
+        name: String,
+        #[serde(alias = "evalue")]
+        value: String,
+        traceback: Option<PlainText>,
+    },
+    ExecutionState {
+        #[serde(alias = "execution_state")]
+        state: ExecutionState,
+    },
+}
+
+impl IoPubSubMessageContent {
+    pub(crate) fn error_string(&self) -> Option<String> {
+        let Self::Error {
+            name,
+            value,
+            traceback,
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "{}: {}\n{}",
+            name,
+            value,
+            traceback.as_ref()?.to_string()
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PlainText {
+    Text(String),
+    MultiLineText(Vec<String>),
+}
+
+impl ToString for PlainText {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::MultiLineText(lines) => lines.join("\n"),
+        }
+    }
+}
+
+// https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MimeData {
+    PlainText(PlainText),
+    B64EncodedMultiLineText(Vec<String>),
+    Json(HashMap<String, serde_json::Value>),
+}
+
+#[derive(Debug, Deserialize)]
+pub enum ExecutionState {
+    #[serde(alias = "starting")]
+    Starting,
+    #[serde(alias = "busy")]
+    Busy,
+    #[serde(alias = "idle")]
+    Idle,
 }
