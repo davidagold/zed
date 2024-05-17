@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod cell;
+pub mod chat;
 mod common;
 pub mod editor;
 mod jupyter;

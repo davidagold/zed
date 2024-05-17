@@ -1,31 +1,39 @@
 //! Jupyter support for Zed.
 
+use assistant2::{completion_provider::CompletionProvider, AssistantMessagePart};
+use assistant_tooling::ToolRegistry;
 use editor::{
     items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MAX_TAB_TITLE_LEN,
 };
+use futures::StreamExt;
 use gpui::{
-    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    AnyView, AppContext, Entity, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
 use itertools::Itertools;
 use language::Buffer;
+use log::error;
+use markdown::{Markdown, MarkdownStyle};
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
+    sync::Arc,
 };
 use text::Bias;
+use theme::ActiveTheme;
 use ui::{
-    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
-    Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, px, Color, Context, FluentBuilder, InteractiveElement, IntoElement, Label,
+    LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
 };
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
-    actions,
+    actions::{self, NewChatCell},
     cell::{Cell, CellBuilder, CellId, CellType},
+    chat::Chat,
     do_in,
     kernel::KernelEvent,
     Notebook,
@@ -35,6 +43,7 @@ pub struct NotebookEditor {
     notebook: Model<Notebook>,
     editor: View<Editor>,
     focus_handle: FocusHandle,
+    chat: Chat,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -103,6 +112,7 @@ impl NotebookEditor {
             notebook: notebook_handle,
             editor,
             focus_handle,
+            chat: Chat::new(project.downgrade(), "gpt-4-turbo-preview".into(), cx),
             _subscriptions: subscriptions,
         }
     }
@@ -200,7 +210,7 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellAbove,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Left, cx)
+        self.insert_cell(Bias::Left, None, cx)
     }
 
     fn insert_cell_below(
@@ -208,10 +218,15 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellBelow,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Right, cx)
+        self.insert_cell(Bias::Right, None, cx)
     }
 
-    fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
+    fn insert_cell(
+        &mut self,
+        bias: Bias,
+        cell_type: Option<CellType>,
+        cx: &mut ViewContext<Self>,
+    ) -> () {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return ();
         };
@@ -225,9 +240,11 @@ impl NotebookEditor {
                 Bias::Left => current_cell_id,
                 Bias::Right => current_cell_id.pre_inc(),
             };
+            // let cell_type = cell_type_option.unwrap_or_default();
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.clone().into())
                 .source(source)
+                .cell_type(cell_type.unwrap_or_default())
                 .build(cx);
             let _ = self.notebook.update(cx, |notebook, cx| {
                 match cell.cell_type {
@@ -259,6 +276,44 @@ impl NotebookEditor {
                 s.select_ranges([point..point])
             });
         });
+    }
+
+    fn new_chat_cell(&mut self, _cmd: &actions::NewChatCell, cx: &mut ViewContext<Self>) -> () {
+        self.insert_cell(Bias::Right, Some(CellType::Chat), cx);
+    }
+
+    async fn next_chat_turn<'cx>(
+        &mut self,
+        cell_id: &CellId,
+        cx: &mut ViewContext<'cx, Self>,
+    ) -> () {
+        let Some(completion) = do_in!(|| -> Option<_> {
+            CompletionProvider::get(cx).complete(
+                self.chat.model.clone(),
+                self.chat.history(),
+                Vec::new(),
+                1.0,
+                self.chat.tool_registry.as_ref()?.definitions(),
+            )
+        }) else {
+            error!("Missing tools");
+            return;
+        };
+
+        let Ok(mut stream) = completion.await else {
+            return;
+        };
+        let Some(language_registry) = self.chat.language_registry.clone() else {
+            return;
+        };
+        let mut message = AssistantMessagePart {
+            body: cx
+                .new_view(|cx| Markdown::new("".into(), markdown_style(cx), language_registry, cx)),
+            tool_calls: Vec::new(),
+        };
+        while let Some(delta) = stream.next().await {
+            //
+        }
     }
 }
 
@@ -367,10 +422,11 @@ impl Render for NotebookEditor {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.editor.clone())
-            .on_action(cx.listener(NotebookEditor::run_current_cell))
             .on_action(cx.listener(NotebookEditor::insert_cell_above))
             .on_action(cx.listener(NotebookEditor::insert_cell_below))
+            .on_action(cx.listener(NotebookEditor::new_chat_cell))
             .on_action(cx.listener(NotebookEditor::run_current_selection))
+            .on_action(cx.listener(NotebookEditor::run_current_cell))
     }
 }
 
@@ -391,4 +447,43 @@ impl workspace::item::ProjectItem for NotebookEditor {
 
 pub fn init(cx: &mut AppContext) {
     workspace::register_project_item::<NotebookEditor>(cx);
+}
+
+fn markdown_style(cx: &mut ViewContext<Markdown>) -> MarkdownStyle {
+    MarkdownStyle {
+        code_block: gpui::TextStyleRefinement {
+            font_family: Some("Zed Mono".into()),
+            color: Some(cx.theme().colors().editor_foreground),
+            background_color: Some(cx.theme().colors().editor_background),
+            ..Default::default()
+        },
+        inline_code: gpui::TextStyleRefinement {
+            font_family: Some("Zed Mono".into()),
+            // @nate: Could we add inline-code specific styles to the theme?
+            color: Some(cx.theme().colors().editor_foreground),
+            background_color: Some(cx.theme().colors().editor_background),
+            ..Default::default()
+        },
+        rule_color: Color::Muted.color(cx),
+        block_quote_border_color: Color::Muted.color(cx),
+        block_quote: gpui::TextStyleRefinement {
+            color: Some(Color::Muted.color(cx)),
+            ..Default::default()
+        },
+        link: gpui::TextStyleRefinement {
+            color: Some(Color::Accent.color(cx)),
+            underline: Some(gpui::UnderlineStyle {
+                thickness: px(1.),
+                color: Some(Color::Accent.color(cx)),
+                wavy: false,
+            }),
+            ..Default::default()
+        },
+        syntax: cx.theme().syntax().clone(),
+        selection_background_color: {
+            let mut selection = cx.theme().players().local().selection;
+            selection.fade_out(0.7);
+            selection
+        },
+    }
 }

@@ -1,7 +1,5 @@
 use crate::jupyter;
-use crate::jupyter::message::{
-    self, ExecutionState, IoPubSubMessageContent, IoPubSubMessageType, MessageType, MimeData,
-};
+use crate::jupyter::message::{IoPubSubMessageContent, IoPubSubMessageType, MessageType, MimeData};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
@@ -131,6 +129,11 @@ impl CellBuilder {
 
     pub fn source(mut self, source: Model<Buffer>) -> Self {
         self.source.replace(source);
+        self
+    }
+
+    pub fn cell_type(mut self, cell_type: CellType) -> Self {
+        self.cell_type.replace(cell_type);
         self
     }
 
@@ -272,6 +275,7 @@ pub enum CellType {
     // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cells
     #[default]
     Code,
+    Chat,
 }
 
 struct CellTypeVisitor();
@@ -546,9 +550,9 @@ impl Cells {
                         for (mime_type, mime_data) in data {
                             match (mime_type, mime_data) {
                                 (Plain, MimeData::PlainText(text)) => {
-                                    let text = text.to_string();
-                                    buffer_handle
-                                        .update(cx, |buffer, cx| buffer.set_text(text, cx));
+                                    buffer_handle.update(cx, |buffer, cx| {
+                                        buffer.set_text(text.to_string(), cx)
+                                    });
                                 }
                                 _ => {}
                             }

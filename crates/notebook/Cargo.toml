@@ -12,8 +12,7 @@ path = "src/notebook.rs"
 doctest = false
 
 [dependencies]
-# async-trait = { workspace = true, "optional" = true }
-# regex.workspace = true
+assistant2.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 command_palette_hooks.workspace = true
@@ -24,7 +23,9 @@ itertools.workspace = true
 language.workspace = true
 languages.workspace = true
 log.workspace = true
+markdown.workspace = true
 multi_buffer.workspace = true
+open_ai.workspace = true
 project.workspace = true
 pyo3 = { version = "0.21.2", features = ["experimental-async"] }
 regex.workspace = true
@@ -42,6 +43,7 @@ theme.workspace = true
 tokio = { version = "1.36.0", features = ["full"] }
 tree-sitter-python = { workspace = true }
 tree-sitter.workspace = true
+assistant_tooling.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true

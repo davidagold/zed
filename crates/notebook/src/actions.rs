@@ -6,6 +6,7 @@ actions!(
         RunCurrentCell,
         RunCurrentSelection,
         InsertCellAbove,
-        InsertCellBelow
+        InsertCellBelow,
+        NewChatCell,
     ]
 );

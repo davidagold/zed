@@ -1,24 +1,22 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use futures::{select, Future, FutureExt};
-use gpui::{AsyncAppContext, EventEmitter, Flatten, Model, Task};
+use gpui::{AsyncAppContext, EventEmitter, Model, Task};
 use log::{error, info};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDict, PyString, PyTuple};
+use pyo3::types::{PyAnyMethods, PyDict, PyString};
 use pyo3::{pyclass, Bound, Py, PyAny, PyResult, Python};
-use ui::{Context, ViewContext};
+use ui::Context;
 
-use std::sync::mpsc::TrySendError;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cell::{Cell, CellId};
 use crate::common::{forward_err_with, forward_with_print};
 use crate::do_in;
-use crate::editor::NotebookEditor;
 use crate::jupyter;
-use crate::jupyter::message::{IoPubSubMessageType, Message, MessageType};
+use crate::jupyter::message::Message;
 use crate::jupyter::python::{Callback, Coroutine, Pydantic, TryAsStr};
 use crate::kwargs;
 use std::pin::Pin;
@@ -63,7 +61,7 @@ impl JupyterKernelClient {
     pub async fn new_model(mut cx: AsyncAppContext) -> Result<Model<JupyterKernelClient>> {
         let (command_tx, command_rx) = mpsc::channel::<KernelCommand>(1024);
         let client = JupyterKernelClient { command_tx };
-        let client_handle = cx.new_model(|cx| client)?;
+        let client_handle = cx.new_model(|_cx| client)?;
 
         let cloned_client_handle = client_handle.clone();
         cx.spawn(|cx| async move {
@@ -88,7 +86,7 @@ impl JupyterKernelClient {
     {
         let code: String = cell
             .source
-            .read_with(cx, |buffer, cx| buffer.text_snapshot().text())
+            .read_with(cx, |buffer, _cx| buffer.text_snapshot().text())
             .into();
         self.send(KernelCommand::run(cell.id.get(), code)).into()
     }
