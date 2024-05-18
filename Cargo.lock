@@ -6557,6 +6557,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "settings",
+ "smol",
  "sum_tree",
  "text",
  "theme",

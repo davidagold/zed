@@ -1,6 +1,6 @@
 //! Jupyter support for Zed.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use assistant::{
     completion_provider::CompletionProvider, LanguageModel, LanguageModelRequest,
     LanguageModelRequestMessage,
@@ -16,7 +16,6 @@ use gpui::{
 use itertools::Itertools;
 use language::Buffer;
 use log::{error, info};
-// use markdown::{Markdown, MarkdownStyle};
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
@@ -33,7 +32,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions::{self, NewChatCell},
-    cell::{Cell, CellBuilder, CellId, CellType},
+    cell::{excerpt_ids_for_cell, Cell, CellBuilder, CellId, CellType},
     chat::Chat,
     do_in,
     kernel::KernelEvent,
@@ -225,7 +224,7 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellAbove,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Left, None, cx)
+        self.insert_cell(Bias::Left, None, cx);
     }
 
     fn insert_cell_below(
@@ -233,46 +232,44 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellBelow,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Right, None, cx)
+        self.insert_cell(Bias::Right, None, cx);
     }
 
-    fn insert_cell(
+    fn insert_cell<'cx>(
         &mut self,
         bias: Bias,
         cell_type: Option<CellType>,
-        cx: &mut ViewContext<Self>,
-    ) -> () {
+        cx: &'cx mut ViewContext<Self>,
+    ) -> Option<CellId> {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
-            return ();
+            return None;
         };
 
-        do_in!(|| {
-            let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
-                let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
-                Some(current_cell.id.get().clone())
-            })?;
-            let new_cell_id = match bias {
-                Bias::Left => current_cell_id,
-                Bias::Right => current_cell_id.pre_inc(),
-            };
-            let source = cx.new_model(|cx| Buffer::local("", cx));
-            let cell = CellBuilder::new(new_cell_id.clone().into())
-                .source(source)
-                .cell_type(cell_type.unwrap_or_default())
-                .build(cx);
+        let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
+            let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
+            Some(current_cell.id.get().clone())
+        })?;
+        let new_cell_id = match bias {
+            Bias::Left => current_cell_id,
+            Bias::Right => current_cell_id.pre_inc(),
+        };
+        let source = cx.new_model(|cx| Buffer::local("\n", cx));
+        let cell = CellBuilder::new(new_cell_id.into())
+            .source(source)
+            .cell_type(cell_type.unwrap_or_default())
+            .build(cx);
 
-            let _ = self.notebook.update(cx, |notebook, cx| {
-                match cell.cell_type {
-                    CellType::Code => {
-                        notebook.try_set_source_languages(cx, Some(vec![&cell]));
-                    }
-                    _ => {}
+        let _ = self.notebook.update(cx, |notebook, cx| {
+            match cell.cell_type {
+                CellType::Code => {
+                    notebook.try_set_source_languages(cx, Some(vec![&cell]));
                 }
-                notebook.cells.insert(vec![cell], cx);
-                cx.notify();
-            });
-            self.focus_cell(&new_cell_id, None, cx);
+                _ => {}
+            }
+            notebook.cells.insert(vec![cell], cx);
         });
+        self.focus_cell(&new_cell_id, None, cx);
+        Some(new_cell_id)
     }
 
     fn focus_cell<C: VisualContext>(&mut self, cell_id: &CellId, point: Option<Point>, cx: &mut C) {
@@ -299,29 +296,23 @@ impl NotebookEditor {
 
     fn next_chat_turn<'cx>(&mut self, cell: &Cell, cx: &mut ViewContext<'cx, Self>) -> Result<()> {
         let chat = &mut self.chat;
+        let buffer_handle = cx.new_model(|cx| {
+            let buffer = Buffer::local("", cx);
+            let Some(registry) = chat.language_registry.as_ref() else {
+                return buffer;
+            };
+            let markdown = registry.language_for_name("markdown");
+            cx.spawn(|buffer_handle, mut cx| async move {
+                let markdown = markdown.await?;
+                buffer_handle.update(&mut cx, |buffer, cx| {
+                    buffer.set_language(Some(markdown), cx)
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
 
-        let buffer_handle = match cell.output_content.as_ref() {
-            Some(buffer_handle) => buffer_handle.clone(),
-            None => cx
-                .new_model(|cx| {
-                    let buffer = Buffer::local("", cx);
-                    let Some(registry) = chat.language_registry.as_ref() else {
-                        return buffer;
-                    };
-                    let markdown = registry.language_for_name("markdown");
-                    cx.spawn(|buffer_handle, mut cx| async move {
-                        let markdown = markdown.await?;
-                        buffer_handle.update(&mut cx, |buffer, cx| {
-                            // buffer.set_language(Some(markdown), cx)
-                        })?;
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-
-                    buffer
-                })
-                .into(),
-        };
+            buffer
+        });
 
         self.notebook.update(cx, |notebook, cx| {
             let mut updated = cell.clone();
@@ -342,39 +333,66 @@ impl NotebookEditor {
             temperature: 1.0,
         };
 
-        let stream = CompletionProvider::global(cx).complete(request);
+        let buffer_id = buffer_handle.read(cx).remote_id();
         let cell_id = cell.id.get();
-        let mut cells = self
-            .notebook
-            .read_with(cx, |notebook, cx| notebook.cells.clone());
-
-        cx.spawn(|_this, mut cx| async move {
+        let stream = CompletionProvider::global(cx).complete(request);
+        cx.spawn(|this, mut cx| async move {
             let mut messages = stream.await?;
+            let mut offset = 0;
             while let Some(message) = messages.next().await {
-                let content = message?;
-                if let Err(err) = buffer_handle.update(&mut cx, |buffer, cx| {
-                    let mut offset = buffer.len();
-                    let lines = buffer.text_summary().lines;
-                    if lines.column + content.len() as u32 > 96
-                        && !content.starts_with(".")
-                        && !content.starts_with(" ")
-                        && !content.starts_with(",")
-                        && !content.starts_with("(")
-                    {
-                        buffer.edit([(offset..offset, "\n")], None, cx);
-                        offset += 1
-                    }
-                    buffer.edit([(offset..offset, content)], None, cx);
-                    anyhow::Ok(())
+                let mut content = message?;
+
+                if let Err(err) = this.update(&mut cx, |nb_editor, cx| {
+                    nb_editor.notebook.update(cx, |notebook, cx| {
+                        notebook.cells.multi.update(cx, |multi, cx| {
+                            let Some(buffer_handle) = multi.buffer(buffer_id) else {
+                                return Err(anyhow!("Failed to obtain buffer handle"));
+                            };
+
+                            buffer_handle.update(cx, |buffer, cx| {
+                                let lines = buffer.text_summary().lines;
+                                // TODO: How do I set `SoftWrap` for a specific excerpt?
+                                if lines.column + content.len() as u32 > 96
+                                    && !content.starts_with(".")
+                                    && !content.starts_with(",")
+                                    && !content.starts_with("(")
+                                    && !content.starts_with(")")
+                                    && !content.starts_with("[")
+                                    && !content.starts_with("]")
+                                    && !content.starts_with("'")
+                                {
+                                    buffer.edit([(offset..offset, "\n")], None, cx);
+                                    if content.starts_with(" ") {
+                                        content.remove(0);
+                                    }
+                                    offset += 1;
+                                }
+                                buffer.edit([(offset..offset, content.as_str())], None, cx);
+                                offset += content.len();
+                            });
+                            anyhow::Ok(())
+                        })
+                    })
                 }) {
                     error!("{:#?}", err)
                 };
+                smol::future::yield_now().await;
             }
-            do_in!(|| {
-                let updated = cells.get_cell_by_id(&cell_id)?.clone();
-                updated.update_titles(true, &mut cx);
-                cells.replace(updated, &mut cx);
-            });
+
+            buffer_handle.update(&mut cx, |buffer, cx| {
+                buffer.set_text(buffer.text() + "\n", cx);
+            })?;
+
+            this.update(&mut cx, |nb_editor, cx| {
+                nb_editor.notebook.update(cx, |notebook, cx| {
+                    notebook.cells.multi.update(cx, |multi, cx| cx.notify());
+                    do_in!(|| {
+                        let updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                        updated.update_titles(true, cx);
+                        notebook.cells.replace(updated, cx);
+                    });
+                });
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
