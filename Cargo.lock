@@ -6532,7 +6532,7 @@ name = "notebook"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "assistant2",
+ "assistant",
  "assistant_tooling",
  "collections",
  "command_palette_hooks",

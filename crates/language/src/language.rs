@@ -825,7 +825,7 @@ impl LanguageId {
 
 pub struct Language {
     pub(crate) id: LanguageId,
-    pub(crate) config: LanguageConfig,
+    pub config: LanguageConfig,
     pub(crate) grammar: Option<Arc<Grammar>>,
     pub(crate) context_provider: Option<Arc<dyn ContextProvider>>,
 }

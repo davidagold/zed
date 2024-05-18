@@ -8,7 +8,7 @@ pub use fake::*;
 pub use open_ai::*;
 pub use zed::*;
 
-use crate::{
+pub use crate::{
     assistant_settings::{AssistantProvider, AssistantSettings},
     LanguageModel, LanguageModelRequest,
 };

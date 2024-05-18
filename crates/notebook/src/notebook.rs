@@ -10,6 +10,7 @@ use crate::cell::{Cells, KernelSpec};
 use crate::common::{forward_err_with, parse_value};
 use crate::jupyter::python::TryAsStr;
 use anyhow::{anyhow, Result};
+use assistant::completion_provider::CompletionProvider;
 use cell::{Cell, CellBuilder, CellId};
 use collections::HashMap;
 use gpui::{AsyncAppContext, Context, Model, WeakModel};
@@ -147,6 +148,9 @@ impl<'cx> NotebookBuilder<'cx> {
                 notebook.try_set_source_languages(cx, None);
             }
         ));
+        self.cx
+            .update_global(|provider: &mut CompletionProvider, cx| provider.authenticate(cx))?
+            .await?;
 
         Ok(notebook)
     }

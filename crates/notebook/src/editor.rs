@@ -1,31 +1,34 @@
 //! Jupyter support for Zed.
 
-use assistant2::{completion_provider::CompletionProvider, AssistantMessagePart};
-use assistant_tooling::ToolRegistry;
+use anyhow::{anyhow, Result};
+use assistant::{
+    completion_provider::CompletionProvider, LanguageModel, LanguageModelRequest,
+    LanguageModelRequestMessage,
+};
 use editor::{
     items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MAX_TAB_TITLE_LEN,
 };
 use futures::StreamExt;
 use gpui::{
-    AnyView, AppContext, Entity, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
+    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
     Subscription, View,
 };
 use itertools::Itertools;
-use language::Buffer;
-use log::error;
+use language::{Buffer, LanguageConfig};
+use log::{error, info};
 use markdown::{Markdown, MarkdownStyle};
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
-    sync::Arc,
 };
+use sum_tree::SumTree;
 use text::Bias;
 use theme::ActiveTheme;
 use ui::{
-    div, h_flex, px, Color, Context, FluentBuilder, InteractiveElement, IntoElement, Label,
-    LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, px, Color, Context, Element, FluentBuilder, InteractiveElement, IntoElement,
+    Label, LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
 };
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
@@ -112,7 +115,11 @@ impl NotebookEditor {
             notebook: notebook_handle,
             editor,
             focus_handle,
-            chat: Chat::new(project.downgrade(), "gpt-4-turbo-preview".into(), cx),
+            chat: Chat::new(
+                project.downgrade(),
+                LanguageModel::OpenAi(open_ai::Model::FourTurbo),
+                cx,
+            ),
             _subscriptions: subscriptions,
         }
     }
@@ -132,13 +139,23 @@ impl NotebookEditor {
             let current_cell = self.active_cell(cx)?.clone();
             let next_cell_id = current_cell.id.get().pre_inc();
             self.focus_cell(&next_cell_id, None, cx);
-            self.notebook
-                .read(cx)
-                .client_handle
-                .as_ref()?
-                .read(cx)
-                .run_cell(&current_cell, cx);
-            current_cell.id.get().pre_inc()
+            match current_cell.cell_type {
+                CellType::Code => {
+                    self.notebook
+                        .read(cx)
+                        .client_handle
+                        .as_ref()?
+                        .read(cx)
+                        .run_cell(&current_cell, cx)
+                        .ok()?;
+                }
+                CellType::Chat => {
+                    if let Err(err) = self.next_chat_turn(&current_cell, cx) {
+                        error!("{:#?}", err);
+                    }
+                }
+                _ => {}
+            }
         });
     }
 
@@ -240,12 +257,12 @@ impl NotebookEditor {
                 Bias::Left => current_cell_id,
                 Bias::Right => current_cell_id.pre_inc(),
             };
-            // let cell_type = cell_type_option.unwrap_or_default();
             let source = cx.new_model(|cx| Buffer::local("", cx));
             let cell = CellBuilder::new(new_cell_id.clone().into())
                 .source(source)
                 .cell_type(cell_type.unwrap_or_default())
                 .build(cx);
+
             let _ = self.notebook.update(cx, |notebook, cx| {
                 match cell.cell_type {
                     CellType::Code => {
@@ -282,38 +299,86 @@ impl NotebookEditor {
         self.insert_cell(Bias::Right, Some(CellType::Chat), cx);
     }
 
-    async fn next_chat_turn<'cx>(
-        &mut self,
-        cell_id: &CellId,
-        cx: &mut ViewContext<'cx, Self>,
-    ) -> () {
-        let Some(completion) = do_in!(|| -> Option<_> {
-            CompletionProvider::get(cx).complete(
-                self.chat.model.clone(),
-                self.chat.history(),
-                Vec::new(),
-                1.0,
-                self.chat.tool_registry.as_ref()?.definitions(),
-            )
-        }) else {
-            error!("Missing tools");
-            return;
+    fn next_chat_turn<'cx>(&mut self, cell: &Cell, cx: &mut ViewContext<'cx, Self>) -> Result<()> {
+        let chat = &mut self.chat;
+
+        let buffer_handle = match cell.output_content.as_ref() {
+            Some(buffer_handle) => buffer_handle.clone(),
+            None => cx
+                .new_model(|cx| {
+                    let buffer = Buffer::local("", cx);
+                    let Some(registry) = chat.language_registry.as_ref() else {
+                        return buffer;
+                    };
+                    let markdown = registry.language_for_name("markdown");
+                    cx.spawn(|buffer_handle, mut cx| async move {
+                        let markdown = markdown.await?;
+                        buffer_handle.update(&mut cx, |buffer, cx| {
+                            buffer.set_language(Some(markdown), cx)
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+
+                    buffer
+                })
+                .into(),
         };
 
-        let Ok(mut stream) = completion.await else {
-            return;
+        self.notebook.update(cx, |notebook, cx| {
+            let mut updated = cell.clone();
+            updated.output_content.replace(buffer_handle.clone());
+            updated.update_titles(false, cx);
+            notebook.cells.replace(updated, cx);
+        });
+
+        let msg = LanguageModelRequestMessage {
+            role: assistant::Role::User,
+            content: cell.source.read(cx).text(),
         };
-        let Some(language_registry) = self.chat.language_registry.clone() else {
-            return;
+        chat.messages.push(msg);
+        let request = LanguageModelRequest {
+            model: chat.model.clone(),
+            messages: chat.history(),
+            stop: vec![],
+            temperature: 1.0,
         };
-        let mut message = AssistantMessagePart {
-            body: cx
-                .new_view(|cx| Markdown::new("".into(), markdown_style(cx), language_registry, cx)),
-            tool_calls: Vec::new(),
-        };
-        while let Some(delta) = stream.next().await {
-            //
-        }
+
+        let stream = CompletionProvider::global(cx).complete(request);
+        let cell_id = cell.id.get();
+        let mut cells = self
+            .notebook
+            .read_with(cx, |notebook, cx| notebook.cells.clone());
+
+        cx.spawn(|_this, mut cx| async move {
+            let mut messages = stream.await?;
+            while let Some(message) = messages.next().await {
+                let content = message?;
+                if let Err(err) = buffer_handle.update(&mut cx, |buffer, cx| {
+                    let mut offset = buffer.len();
+                    let lines = buffer.text_summary().lines;
+                    if lines.column + content.len() as u32 > 96
+                        && (!content.starts_with(".") && !content.starts_with(" "))
+                    {
+                        buffer.edit([(offset..offset, "\n")], None, cx);
+                        offset += 1
+                    }
+                    buffer.edit([(offset..offset, content)], None, cx);
+                    anyhow::Ok(())
+                }) {
+                    error!("{:#?}", err)
+                };
+            }
+            do_in!(|| {
+                let updated = cells.get_cell_by_id(&cell_id)?.clone();
+                updated.update_titles(true, &mut cx);
+                cells.replace(updated, &mut cx);
+            });
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+
+        Ok(())
     }
 }
 
@@ -447,43 +512,4 @@ impl workspace::item::ProjectItem for NotebookEditor {
 
 pub fn init(cx: &mut AppContext) {
     workspace::register_project_item::<NotebookEditor>(cx);
-}
-
-fn markdown_style(cx: &mut ViewContext<Markdown>) -> MarkdownStyle {
-    MarkdownStyle {
-        code_block: gpui::TextStyleRefinement {
-            font_family: Some("Zed Mono".into()),
-            color: Some(cx.theme().colors().editor_foreground),
-            background_color: Some(cx.theme().colors().editor_background),
-            ..Default::default()
-        },
-        inline_code: gpui::TextStyleRefinement {
-            font_family: Some("Zed Mono".into()),
-            // @nate: Could we add inline-code specific styles to the theme?
-            color: Some(cx.theme().colors().editor_foreground),
-            background_color: Some(cx.theme().colors().editor_background),
-            ..Default::default()
-        },
-        rule_color: Color::Muted.color(cx),
-        block_quote_border_color: Color::Muted.color(cx),
-        block_quote: gpui::TextStyleRefinement {
-            color: Some(Color::Muted.color(cx)),
-            ..Default::default()
-        },
-        link: gpui::TextStyleRefinement {
-            color: Some(Color::Accent.color(cx)),
-            underline: Some(gpui::UnderlineStyle {
-                thickness: px(1.),
-                color: Some(Color::Accent.color(cx)),
-                wavy: false,
-            }),
-            ..Default::default()
-        },
-        syntax: cx.theme().syntax().clone(),
-        selection_background_color: {
-            let mut selection = cx.theme().players().local().selection;
-            selection.fade_out(0.7);
-            selection
-        },
-    }
 }

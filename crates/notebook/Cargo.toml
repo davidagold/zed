@@ -12,7 +12,7 @@ path = "src/notebook.rs"
 doctest = false
 
 [dependencies]
-assistant2.workspace = true
+assistant.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 command_palette_hooks.workspace = true

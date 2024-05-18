@@ -362,6 +362,16 @@ pub struct Cells {
     pub(crate) multi: Model<MultiBuffer>,
 }
 
+// This API is perhaps not the most foolproof but it is convenient
+impl Clone for Cells {
+    fn clone(&self) -> Self {
+        Cells {
+            tree: SumTree::from_iter(self.tree.iter().map(Cell::clone), &()),
+            multi: self.multi.clone(),
+        }
+    }
+}
+
 impl Cells {
     pub fn iter(&self) -> impl Iterator<Item = &Cell> {
         self.tree.iter()
@@ -524,7 +534,6 @@ impl Cells {
                 use IoPubSubMessageContent::*;
                 use IoPubSubMessageType::*;
 
-                warn!("{:#?}", msg.content);
                 let content = match serde_json::from_value::<IoPubSubMessageContent>(
                     serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
                 ) {

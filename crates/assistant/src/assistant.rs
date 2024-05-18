@@ -1,19 +1,18 @@
 pub mod assistant_panel;
 pub mod assistant_settings;
 mod codegen;
-mod completion_provider;
+pub mod completion_provider;
 mod prompts;
 mod saved_conversation;
 mod streaming_diff;
 
 mod embedded_scope;
-
 pub use assistant_panel::AssistantPanel;
 use assistant_settings::{AssistantSettings, OpenAiModel, ZedDotDevModel};
 use chrono::{DateTime, Local};
 use client::{proto, Client};
 use command_palette_hooks::CommandPaletteFilter;
-pub(crate) use completion_provider::*;
+use completion_provider::*;
 use gpui::{actions, AppContext, BorrowAppContext, Global, SharedString};
 pub(crate) use saved_conversation::*;
 use serde::{Deserialize, Serialize};
@@ -113,7 +112,7 @@ impl LanguageModel {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct LanguageModelRequestMessage {
     pub role: Role,
     pub content: String,
