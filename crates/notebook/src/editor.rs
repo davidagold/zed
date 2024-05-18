@@ -1,6 +1,6 @@
 //! Jupyter support for Zed.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use assistant::{
     completion_provider::CompletionProvider, LanguageModel, LanguageModelRequest,
     LanguageModelRequestMessage,
@@ -14,21 +14,19 @@ use gpui::{
     Subscription, View,
 };
 use itertools::Itertools;
-use language::{Buffer, LanguageConfig};
+use language::Buffer;
 use log::{error, info};
-use markdown::{Markdown, MarkdownStyle};
+// use markdown::{Markdown, MarkdownStyle};
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
     any::{Any, TypeId},
     convert::AsRef,
 };
-use sum_tree::SumTree;
 use text::Bias;
-use theme::ActiveTheme;
 use ui::{
-    div, h_flex, px, Color, Context, Element, FluentBuilder, InteractiveElement, IntoElement,
-    Label, LabelCommon, Render, SharedString, Styled, ViewContext, VisualContext,
+    div, h_flex, Context, FluentBuilder, InteractiveElement, IntoElement, Label, LabelCommon,
+    Render, SharedString, Styled, ViewContext, VisualContext,
 };
 use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
@@ -82,12 +80,12 @@ impl NotebookEditor {
             cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
                 cx.emit(event.clone());
                 match event {
-                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
+                    EditorEvent::ScrollPositionChanged { .. } => {}
                     EditorEvent::BufferEdited => {
                         do_in!(|| {
                             let mut active_cell = this.active_cell(cx)?.clone();
                             active_cell.update_text_summary(cx);
-                            this.notebook.update(cx, |notebook, cx| {
+                            this.notebook.update(cx, |notebook, _cx| {
                                 notebook.cells.tree.insert_or_replace(active_cell, &());
                             });
                         });
@@ -314,7 +312,7 @@ impl NotebookEditor {
                     cx.spawn(|buffer_handle, mut cx| async move {
                         let markdown = markdown.await?;
                         buffer_handle.update(&mut cx, |buffer, cx| {
-                            buffer.set_language(Some(markdown), cx)
+                            // buffer.set_language(Some(markdown), cx)
                         })?;
                         anyhow::Ok(())
                     })
@@ -358,7 +356,10 @@ impl NotebookEditor {
                     let mut offset = buffer.len();
                     let lines = buffer.text_summary().lines;
                     if lines.column + content.len() as u32 > 96
-                        && (!content.starts_with(".") && !content.starts_with(" "))
+                        && !content.starts_with(".")
+                        && !content.starts_with(" ")
+                        && !content.starts_with(",")
+                        && !content.starts_with("(")
                     {
                         buffer.edit([(offset..offset, "\n")], None, cx);
                         offset += 1
