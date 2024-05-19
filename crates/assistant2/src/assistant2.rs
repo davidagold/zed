@@ -1,6 +1,6 @@
 mod assistant_settings;
 mod attachments;
-pub mod completion_provider;
+mod completion_provider;
 mod saved_conversation;
 mod saved_conversations;
 mod tools;
@@ -1144,20 +1144,14 @@ impl Render for AssistantChat {
 pub struct MessageId(usize);
 
 impl MessageId {
-    pub fn post_inc(&mut self) -> Self {
+    fn post_inc(&mut self) -> Self {
         let id = *self;
         self.0 += 1;
         id
     }
 }
 
-impl From<usize> for MessageId {
-    fn from(id: usize) -> Self {
-        MessageId(id)
-    }
-}
-
-pub enum ChatMessage {
+enum ChatMessage {
     User(UserMessage),
     Assistant(AssistantMessage),
 }
@@ -1171,18 +1165,18 @@ impl ChatMessage {
     }
 }
 
-pub struct UserMessage {
+struct UserMessage {
     pub id: MessageId,
     pub body: View<Markdown>,
     pub attachments: Vec<UserAttachment>,
 }
 
-pub struct AssistantMessagePart {
+struct AssistantMessagePart {
     pub body: View<Markdown>,
     pub tool_calls: Vec<ToolFunctionCall>,
 }
 
-pub struct AssistantMessage {
+struct AssistantMessage {
     pub id: MessageId,
     pub messages: Vec<AssistantMessagePart>,
     pub error: Option<SharedString>,
