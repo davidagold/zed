@@ -10,8 +10,8 @@ use editor::{
 };
 use futures::StreamExt;
 use gpui::{
-    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
-    Subscription, View,
+    AnyView, AppContext, AsyncAppContext, AsyncWindowContext, EventEmitter, FocusHandle,
+    FocusableView, Model, ParentElement, Subscription, View, WeakView,
 };
 use itertools::Itertools;
 use language::Buffer;
@@ -32,7 +32,7 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions::{self, NewChatCell},
-    cell::{excerpt_ids_for_cell, Cell, CellBuilder, CellId, CellType},
+    cell::{self, Cell, CellBuilder, CellId, CellType},
     chat::Chat,
     do_in,
     kernel::KernelEvent,
@@ -75,24 +75,6 @@ impl NotebookEditor {
         subscriptions.push(cx.subscribe(&project, |_this, _project, event, _cx| {
             log::info!("Event: {:#?}", event);
         }));
-        subscriptions.push(
-            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
-                cx.emit(event.clone());
-                match event {
-                    EditorEvent::ScrollPositionChanged { .. } => {}
-                    EditorEvent::BufferEdited => {
-                        do_in!(|| {
-                            let mut active_cell = this.active_cell(cx)?.clone();
-                            active_cell.update_text_summary(cx);
-                            this.notebook.update(cx, |notebook, _cx| {
-                                notebook.cells.tree.insert_or_replace(active_cell, &());
-                            });
-                        });
-                    }
-                    _ => {}
-                }
-            }),
-        );
         if let Some(client_handle) =
             notebook_handle.read_with(cx, |notebook, _cx| notebook.client_handle.clone())
         {
@@ -273,6 +255,9 @@ impl NotebookEditor {
     }
 
     fn focus_cell<C: VisualContext>(&mut self, cell_id: &CellId, point: Option<Point>, cx: &mut C) {
+        self.notebook.update(cx, |notebook, cx| {
+            notebook.cells.sync(cx);
+        });
         self.editor.update(cx, |editor, cx| {
             let Some(cell) = self.notebook.read(cx).cells.get_cell_by_id(cell_id).clone() else {
                 return;
@@ -317,7 +302,10 @@ impl NotebookEditor {
         self.notebook.update(cx, |notebook, cx| {
             let mut updated = cell.clone();
             updated.output_content.replace(buffer_handle.clone());
-            updated.update_titles(false, cx);
+            updated
+                .state
+                .replace(cell::ExecutionState::Running("".into()));
+            updated.update_titles(cx);
             notebook.cells.replace(updated, cx);
         });
 
@@ -336,7 +324,8 @@ impl NotebookEditor {
         let buffer_id = buffer_handle.read(cx).remote_id();
         let cell_id = cell.id.get();
         let stream = CompletionProvider::global(cx).complete(request);
-        cx.spawn(|this, mut cx| async move {
+
+        let stream_task = cx.spawn(|this, mut cx| async move {
             let mut messages = stream.await?;
             let mut offset = 0;
             while let Some(message) = messages.next().await {
@@ -387,12 +376,34 @@ impl NotebookEditor {
                 nb_editor.notebook.update(cx, |notebook, cx| {
                     notebook.cells.multi.update(cx, |multi, cx| cx.notify());
                     do_in!(|| {
-                        let updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
-                        updated.update_titles(true, cx);
+                        let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                        updated
+                            .state
+                            .replace(cell::ExecutionState::Succeeded("".into()));
+                        updated.update_titles(cx);
                         notebook.cells.replace(updated, cx);
                     });
                 });
             })?;
+            anyhow::Ok(())
+        });
+
+        cx.spawn(|this, mut cx| async move {
+            if let Err(err) = stream_task.await {
+                this.update(&mut cx, |nb_editor, cx| {
+                    nb_editor.notebook.update(cx, |notebook, cx| {
+                        notebook.cells.multi.update(cx, |multi, cx| cx.notify());
+                        do_in!(|| {
+                            let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                            updated
+                                .state
+                                .replace(cell::ExecutionState::Failed("".into()));
+                            updated.update_titles(cx);
+                            notebook.cells.replace(updated, cx);
+                        });
+                    });
+                })?;
+            };
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
