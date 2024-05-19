@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub struct NotebookEditor {
-    notebook: Model<Notebook>,
+    pub(crate) notebook: Model<Notebook>,
     editor: View<Editor>,
     focus_handle: FocusHandle,
     chat: Chat,
@@ -90,15 +90,17 @@ impl NotebookEditor {
             ));
         };
 
+        let chat = Chat::new(
+            project.downgrade(),
+            LanguageModel::OpenAi(open_ai::Model::FourTurbo),
+            &notebook_handle,
+            cx,
+        );
         NotebookEditor {
             notebook: notebook_handle,
             editor,
             focus_handle,
-            chat: Chat::new(
-                project.downgrade(),
-                LanguageModel::OpenAi(open_ai::Model::FourTurbo),
-                cx,
-            ),
+            chat: chat,
             _subscriptions: subscriptions,
         }
     }
