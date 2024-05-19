@@ -3,6 +3,7 @@ use log::error;
 use anyhow::anyhow;
 use pyo3::{PyErr, Python};
 use serde::de::DeserializeOwned;
+use ui::Context;
 
 pub(crate) fn parse_value<T: DeserializeOwned, E: serde::de::Error>(
     val: serde_json::Value,
@@ -66,4 +67,20 @@ macro_rules! do_in {
 pub(crate) fn forward_with_print<T>(err: PyErr) -> anyhow::Result<T> {
     do_in!(|py| err.print(py));
     Err(anyhow!(err))
+}
+
+pub trait UpdateInner<Inner>
+where
+    Self: Sized,
+{
+    type OuterContext: Context;
+    type InnerContext<'cx, T>;
+
+    fn update_inner<'inner, 'outer: 'inner, F, R>(
+        &self,
+        cx: &'outer mut Self::OuterContext,
+        update: F,
+    ) -> <Self::OuterContext as Context>::Result<R>
+    where
+        F: FnOnce(&mut Inner, &mut Self::InnerContext<'_, Inner>) -> R;
 }

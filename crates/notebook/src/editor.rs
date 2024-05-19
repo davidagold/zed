@@ -6,12 +6,13 @@ use assistant::{
     LanguageModelRequestMessage,
 };
 use editor::{
-    items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MAX_TAB_TITLE_LEN,
+    items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MultiBuffer,
+    MAX_TAB_TITLE_LEN,
 };
 use futures::StreamExt;
 use gpui::{
     AnyView, AppContext, AsyncAppContext, AsyncWindowContext, EventEmitter, FocusHandle,
-    FocusableView, Model, ParentElement, Subscription, View, WeakView,
+    FocusableView, Model, ModelContext, ParentElement, Subscription, View, WeakView,
 };
 use itertools::Itertools;
 use language::Buffer;
@@ -32,8 +33,9 @@ use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
     actions::{self, NewChatCell},
-    cell::{self, Cell, CellBuilder, CellId, CellType},
+    cell::{self, Cell, CellBuilder, CellId, CellType, Cells},
     chat::Chat,
+    common::UpdateInner,
     do_in,
     kernel::KernelEvent,
     Notebook,
@@ -45,6 +47,40 @@ pub struct NotebookEditor {
     focus_handle: FocusHandle,
     chat: Chat,
     _subscriptions: Vec<Subscription>,
+}
+
+impl UpdateInner<Notebook> for WeakView<NotebookEditor> {
+    type OuterContext = AsyncWindowContext;
+    type InnerContext<'cx, T> = ModelContext<'cx, T>;
+
+    fn update_inner<'inner, 'outer: 'inner, F, R>(
+        &self,
+        cx: &'outer mut AsyncWindowContext,
+        update: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Notebook, &mut ModelContext<'_, Notebook>) -> R,
+    {
+        self.update(cx, |nb_editor, cx| nb_editor.notebook.update(cx, update))
+    }
+}
+
+impl UpdateInner<MultiBuffer> for WeakView<NotebookEditor> {
+    type OuterContext = AsyncWindowContext;
+    type InnerContext<'cx, T> = ModelContext<'cx, T>;
+
+    fn update_inner<'inner, 'outer: 'inner, F, R>(
+        &self,
+        cx: &'outer mut AsyncWindowContext,
+        update: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut MultiBuffer, &mut ModelContext<'_, MultiBuffer>) -> R,
+    {
+        self.update_inner(cx, |notebook: &mut Notebook, cx| {
+            notebook.cells.multi.update(cx, update)
+        })
+    }
 }
 
 impl NotebookEditor {
@@ -326,44 +362,35 @@ impl NotebookEditor {
         let buffer_id = buffer_handle.read(cx).remote_id();
         let cell_id = cell.id.get();
         let stream = CompletionProvider::global(cx).complete(request);
-
         let stream_task = cx.spawn(|this, mut cx| async move {
             let mut messages = stream.await?;
             let mut offset = 0;
             while let Some(message) = messages.next().await {
                 let mut content = message?;
 
-                if let Err(err) = this.update(&mut cx, |nb_editor, cx| {
-                    nb_editor.notebook.update(cx, |notebook, cx| {
-                        notebook.cells.multi.update(cx, |multi, cx| {
-                            let Some(buffer_handle) = multi.buffer(buffer_id) else {
-                                return Err(anyhow!("Failed to obtain buffer handle"));
-                            };
+                if let Err(err) = this.update_inner(&mut cx, |multi: &mut MultiBuffer, cx| {
+                    let Some(buffer_handle) = multi.buffer(buffer_id) else {
+                        return Err(anyhow!("Failed to obtain buffer handle"));
+                    };
 
-                            buffer_handle.update(cx, |buffer, cx| {
-                                let lines = buffer.text_summary().lines;
-                                // TODO: How do I set `SoftWrap` for a specific excerpt?
-                                if lines.column + content.len() as u32 > 96
-                                    && !content.starts_with(".")
-                                    && !content.starts_with(",")
-                                    && !content.starts_with("(")
-                                    && !content.starts_with(")")
-                                    && !content.starts_with("[")
-                                    && !content.starts_with("]")
-                                    && !content.starts_with("'")
-                                {
-                                    buffer.edit([(offset..offset, "\n")], None, cx);
-                                    if content.starts_with(" ") {
-                                        content.remove(0);
-                                    }
-                                    offset += 1;
+                    buffer_handle.update(cx, |buffer, cx| {
+                        let lines = buffer.text_summary().lines;
+                        // TODO: How do I set `SoftWrap` for a specific excerpt?
+                        do_in!(|| {
+                            let no_break_chars = vec![".", ",", "(", ")", "[", "]", "'", "`"];
+                            let can_break = !no_break_chars.iter().contains(&content.get(0..1)?);
+                            if lines.column + content.len() as u32 > 96 && can_break {
+                                buffer.edit([(offset..offset, "\n")], None, cx);
+                                if content.starts_with(" ") {
+                                    content.remove(0);
                                 }
-                                buffer.edit([(offset..offset, content.as_str())], None, cx);
-                                offset += content.len();
-                            });
-                            anyhow::Ok(())
-                        })
-                    })
+                                offset += 1;
+                            }
+                        });
+                        buffer.edit([(offset..offset, content.as_str())], None, cx);
+                        offset += content.len();
+                    });
+                    anyhow::Ok(())
                 }) {
                     error!("{:#?}", err)
                 };
@@ -374,35 +401,30 @@ impl NotebookEditor {
                 buffer.set_text(buffer.text() + "\n", cx);
             })?;
 
-            this.update(&mut cx, |nb_editor, cx| {
-                nb_editor.notebook.update(cx, |notebook, cx| {
-                    notebook.cells.multi.update(cx, |multi, cx| cx.notify());
-                    do_in!(|| {
-                        let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
-                        updated
-                            .state
-                            .replace(cell::ExecutionState::Succeeded("".into()));
-                        updated.update_titles(cx);
-                        notebook.cells.replace(updated, cx);
-                    });
+            this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
+                do_in!(|| {
+                    let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                    updated
+                        .state
+                        .replace(cell::ExecutionState::Succeeded("".into()));
+                    updated.update_titles(cx);
+                    notebook.cells.replace(updated, cx);
                 });
-            })?;
+            });
+
             anyhow::Ok(())
         });
 
         cx.spawn(|this, mut cx| async move {
             if let Err(err) = stream_task.await {
-                this.update(&mut cx, |nb_editor, cx| {
-                    nb_editor.notebook.update(cx, |notebook, cx| {
-                        notebook.cells.multi.update(cx, |multi, cx| cx.notify());
-                        do_in!(|| {
-                            let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
-                            updated
-                                .state
-                                .replace(cell::ExecutionState::Failed("".into()));
-                            updated.update_titles(cx);
-                            notebook.cells.replace(updated, cx);
-                        });
+                this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
+                    do_in!(|| {
+                        let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                        updated
+                            .state
+                            .replace(cell::ExecutionState::Failed("".into()));
+                        updated.update_titles(cx);
+                        notebook.cells.replace(updated, cx);
                     });
                 })?;
             };

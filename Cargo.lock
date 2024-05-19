@@ -6533,7 +6533,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assistant",
- "assistant_tooling",
  "collections",
  "command_palette_hooks",
  "editor",
@@ -6543,7 +6542,6 @@ dependencies = [
  "language",
  "languages",
  "log",
- "markdown",
  "multi_buffer",
  "open_ai",
  "project",
