@@ -1,22 +1,18 @@
 //! Jupyter support for Zed.
 
 use anyhow::{anyhow, Result};
-use assistant::{
-    completion_provider::CompletionProvider, LanguageModel, LanguageModelRequest,
-    LanguageModelRequestMessage,
-};
+use assistant::{LanguageModel, LanguageModelRequestMessage};
 use editor::{
     items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MultiBuffer,
     MAX_TAB_TITLE_LEN,
 };
-use futures::StreamExt;
 use gpui::{
-    AnyView, AppContext, AsyncAppContext, AsyncWindowContext, EventEmitter, FocusHandle,
-    FocusableView, Model, ModelContext, ParentElement, Subscription, View, WeakView,
+    AnyView, AppContext, AsyncWindowContext, EventEmitter, Flatten, FocusHandle, FocusableView,
+    Model, ModelContext, ParentElement, Subscription, View, WeakView,
 };
 use itertools::Itertools;
 use language::Buffer;
-use log::{error, info};
+use log::error;
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
@@ -32,8 +28,8 @@ use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
-    actions::{self, NewChatCell},
-    cell::{self, Cell, CellBuilder, CellId, CellType, Cells},
+    actions::{self},
+    cell::{self, Cell, CellBuilder, CellId, CellType},
     chat::Chat,
     common::UpdateInner,
     do_in,
@@ -49,15 +45,10 @@ pub struct NotebookEditor {
     _subscriptions: Vec<Subscription>,
 }
 
-impl UpdateInner<Notebook> for WeakView<NotebookEditor> {
-    type OuterContext = AsyncWindowContext;
-    type InnerContext<'cx, T> = ModelContext<'cx, T>;
+impl UpdateInner<AsyncWindowContext, Notebook> for WeakView<NotebookEditor> {
+    type InnerContext<'inner, T> = ModelContext<'inner, T>;
 
-    fn update_inner<'inner, 'outer: 'inner, F, R>(
-        &self,
-        cx: &'outer mut AsyncWindowContext,
-        update: F,
-    ) -> Result<R>
+    fn update_inner<F, R>(&self, cx: &mut AsyncWindowContext, update: F) -> Result<R>
     where
         F: FnOnce(&mut Notebook, &mut ModelContext<'_, Notebook>) -> R,
     {
@@ -65,15 +56,10 @@ impl UpdateInner<Notebook> for WeakView<NotebookEditor> {
     }
 }
 
-impl UpdateInner<MultiBuffer> for WeakView<NotebookEditor> {
-    type OuterContext = AsyncWindowContext;
-    type InnerContext<'cx, T> = ModelContext<'cx, T>;
+impl UpdateInner<AsyncWindowContext, MultiBuffer> for WeakView<NotebookEditor> {
+    type InnerContext<'inner, T> = ModelContext<'inner, T>;
 
-    fn update_inner<'inner, 'outer: 'inner, F, R>(
-        &self,
-        cx: &'outer mut AsyncWindowContext,
-        update: F,
-    ) -> Result<R>
+    fn update_inner<F, R>(&self, cx: &mut AsyncWindowContext, update: F) -> Result<R>
     where
         F: FnOnce(&mut MultiBuffer, &mut ModelContext<'_, MultiBuffer>) -> R,
     {
@@ -264,7 +250,6 @@ impl NotebookEditor {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
             return None;
         };
-
         let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
             let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
             Some(current_cell.id.get().clone())
@@ -279,7 +264,7 @@ impl NotebookEditor {
             .cell_type(cell_type.unwrap_or_default())
             .build(cx);
 
-        let _ = self.notebook.update(cx, |notebook, cx| {
+        self.notebook.update(cx, |notebook, cx| {
             match cell.cell_type {
                 CellType::Code => {
                     notebook.try_set_source_languages(cx, Some(vec![&cell]));
@@ -352,83 +337,50 @@ impl NotebookEditor {
             content: cell.source.read(cx).text(),
         };
         chat.messages.push(msg);
-        let request = LanguageModelRequest {
-            model: chat.model.clone(),
-            messages: chat.history(),
-            stop: vec![],
-            temperature: 1.0,
-        };
 
         let buffer_id = buffer_handle.read(cx).remote_id();
         let cell_id = cell.id.get();
-        let stream = CompletionProvider::global(cx).complete(request);
-        let stream_task = cx.spawn(|this, mut cx| async move {
-            let mut messages = stream.await?;
-            let mut offset = 0;
-            while let Some(message) = messages.next().await {
-                let mut content = message?;
 
-                if let Err(err) = this.update_inner(&mut cx, |multi: &mut MultiBuffer, cx| {
-                    let Some(buffer_handle) = multi.buffer(buffer_id) else {
-                        return Err(anyhow!("Failed to obtain buffer handle"));
-                    };
-
-                    buffer_handle.update(cx, |buffer, cx| {
-                        let lines = buffer.text_summary().lines;
-                        // TODO: How do I set `SoftWrap` for a specific excerpt?
-                        do_in!(|| {
-                            let no_break_chars = vec![".", ",", "(", ")", "[", "]", "'", "`"];
-                            let can_break = !no_break_chars.iter().contains(&content.get(0..1)?);
-                            if lines.column + content.len() as u32 > 96 && can_break {
-                                buffer.edit([(offset..offset, "\n")], None, cx);
-                                if content.starts_with(" ") {
-                                    content.remove(0);
-                                }
-                                offset += 1;
-                            }
-                        });
-                        buffer.edit([(offset..offset, content.as_str())], None, cx);
-                        offset += content.len();
-                    });
-                    anyhow::Ok(())
-                }) {
-                    error!("{:#?}", err)
+        let next_turn = chat.next_turn(cx, move |view, mut delta, cx| {
+            view.update_inner(cx, |multi: &mut MultiBuffer, cx| {
+                let Some(buffer_handle) = multi.buffer(buffer_id) else {
+                    return Err(anyhow!("Failed to obtain buffer handle"));
                 };
-                smol::future::yield_now().await;
-            }
-
-            buffer_handle.update(&mut cx, |buffer, cx| {
-                buffer.set_text(buffer.text() + "\n", cx);
-            })?;
-
-            this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
-                do_in!(|| {
-                    let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
-                    updated
-                        .state
-                        .replace(cell::ExecutionState::Succeeded("".into()));
-                    updated.update_titles(cx);
-                    notebook.cells.replace(updated, cx);
-                });
-            });
-
-            anyhow::Ok(())
+                buffer_handle.update(cx, |buffer, cx| {
+                    // TODO: How do I set `SoftWrap` for a specific excerpt?
+                    let mut offset = buffer.text_summary().len;
+                    let lines = buffer.text_summary().lines;
+                    do_in!(|| {
+                        let no_break_chars = vec![".", ",", "(", ")", "[", "]", "'", "`"];
+                        let can_break = !no_break_chars.iter().contains(&delta.get(0..1)?);
+                        if lines.column + delta.len() as u32 > 96 && can_break {
+                            buffer.edit([(offset..offset, "\n")], None, cx);
+                            if delta.starts_with(" ") {
+                                delta.remove(0);
+                            }
+                            offset += 1;
+                        }
+                    });
+                    buffer.edit([(offset..offset, delta.as_str())], None, cx);
+                    anyhow::Ok(())
+                })
+            })
+            .flatten()
         });
 
         cx.spawn(|this, mut cx| async move {
-            if let Err(err) = stream_task.await {
-                this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
-                    do_in!(|| {
-                        let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
-                        updated
-                            .state
-                            .replace(cell::ExecutionState::Failed("".into()));
-                        updated.update_titles(cx);
-                        notebook.cells.replace(updated, cx);
-                    });
-                })?;
+            let state = match next_turn.await {
+                Ok(_) => cell::ExecutionState::Succeeded("".into()),
+                Err(_err) => cell::ExecutionState::Failed("".into()),
             };
-            anyhow::Ok(())
+            this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
+                do_in!(|| {
+                    let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                    updated.state.replace(state);
+                    updated.update_titles(cx);
+                    notebook.cells.replace(updated, cx);
+                });
+            })
         })
         .detach_and_log_err(cx);
 

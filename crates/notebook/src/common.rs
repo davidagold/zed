@@ -1,3 +1,5 @@
+use std::ops::DerefMut;
+
 use log::error;
 
 use anyhow::anyhow;
@@ -35,10 +37,7 @@ where
 #[macro_export]
 macro_rules! do_in {
     (|| $body:expr) => {{
-        (|| -> Option<_> {
-            //
-            { $body }.into()
-        })()
+        (|| -> Option<_> { { $body }.into() })()
     }};
 
     (|$py:ident $(:Python)?| $body:expr) => {{
@@ -50,17 +49,11 @@ macro_rules! do_in {
     }};
 
     (|| $body:block) => {{
-        (|| -> Option<_> {
-            //
-            { $body }.into()
-        })()
+        (|| -> Option<_> { { $body }.into() })()
     }};
 
     (|| -> $ret:ty $body:block) => {{
-        (|| -> $ret {
-            //
-            { $body }.into()
-        })()
+        (|| -> $ret { { $body }.into() })()
     }};
 }
 
@@ -69,18 +62,13 @@ pub(crate) fn forward_with_print<T>(err: PyErr) -> anyhow::Result<T> {
     Err(anyhow!(err))
 }
 
-pub trait UpdateInner<Inner>
+pub trait UpdateInner<OuterContext: Context, Inner>
 where
     Self: Sized,
 {
-    type OuterContext: Context;
-    type InnerContext<'cx, T>;
+    type InnerContext<'inner, T>;
 
-    fn update_inner<'inner, 'outer: 'inner, F, R>(
-        &self,
-        cx: &'outer mut Self::OuterContext,
-        update: F,
-    ) -> <Self::OuterContext as Context>::Result<R>
+    fn update_inner<F, R>(&self, cx: &mut OuterContext, update: F) -> OuterContext::Result<R>
     where
         F: FnOnce(&mut Inner, &mut Self::InnerContext<'_, Inner>) -> R;
 }

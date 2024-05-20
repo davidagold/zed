@@ -1,5 +1,7 @@
-use assistant::{LanguageModel, LanguageModelRequestMessage as Turn, Role};
-use gpui::{self, AppContext};
+use assistant::completion_provider::CompletionProvider;
+use assistant::{LanguageModel, LanguageModelRequest, LanguageModelRequestMessage as Turn, Role};
+use futures::StreamExt;
+use gpui::{self, AppContext, AsyncWindowContext, Result, Task, WeakView};
 use gpui::{Model, WeakModel};
 use itertools::Itertools;
 use language::LanguageRegistry;
@@ -76,6 +78,31 @@ impl Chat {
             content: vec![system_prompt, cells_paragraphs].join("\n\n"),
         };
         self.messages.insert(0, system_prompt);
+    }
+
+    pub fn next_turn<F, V: 'static>(
+        &mut self,
+        cx: &mut ViewContext<'_, V>,
+        mut on_delta: F,
+    ) -> Task<Result<()>>
+    where
+        F: FnMut(&mut WeakView<V>, String, &mut AsyncWindowContext) -> Result<()> + 'static,
+    {
+        let request = LanguageModelRequest {
+            model: self.model.clone(),
+            messages: self.history(),
+            stop: vec![],
+            temperature: 1.0,
+        };
+        let stream = CompletionProvider::global(cx).complete(request);
+        cx.spawn(|mut view, mut cx| async move {
+            let mut deltas = stream.await?;
+            while let Some(Ok(delta)) = deltas.next().await {
+                on_delta(&mut view, delta, &mut cx)?;
+                smol::future::yield_now().await;
+            }
+            anyhow::Ok(())
+        })
     }
 
     pub fn history(&self) -> Vec<Turn> {

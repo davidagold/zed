@@ -514,15 +514,7 @@ impl Cells {
                 use IoPubSubMessageContent::*;
                 use IoPubSubMessageType::*;
 
-                let content = match serde_json::from_value::<IoPubSubMessageContent>(
-                    serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
-                ) {
-                    Ok(content) => content,
-                    Err(err) => {
-                        error!("{:#?}", err);
-                        return None;
-                    }
-                };
+                let content = msg.content_as::<IoPubSubMessageContent>()?;
 
                 match (io_pubsub_msg_type, &content) {
                     (Stream, IoPubSubMessageContent::Stream { name: _name, text }) => {
