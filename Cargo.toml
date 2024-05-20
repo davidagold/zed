@@ -59,6 +59,7 @@ members = [
     "crates/menu",
     "crates/multi_buffer",
     "crates/node_runtime",
+    "crates/notebook",
     "crates/notifications",
     "crates/open_ai",
     "crates/outline",
@@ -76,8 +77,6 @@ members = [
     "crates/rich_text",
     "crates/rope",
     "crates/rpc",
-    "crates/task",
-    "crates/tasks_ui",
     "crates/search",
     "crates/semantic_index",
     "crates/semantic_version",
@@ -88,16 +87,18 @@ members = [
     "crates/story",
     "crates/storybook",
     "crates/sum_tree",
-    "crates/tab_switcher",
     "crates/supermaven",
     "crates/supermaven_api",
+    "crates/tab_switcher",
+    "crates/task",
+    "crates/tasks_ui",
+    "crates/telemetry_events",
     "crates/terminal",
     "crates/terminal_view",
     "crates/text",
     "crates/theme",
     "crates/theme_importer",
     "crates/theme_selector",
-    "crates/telemetry_events",
     "crates/time_format",
     "crates/ui",
     "crates/ui_text_field",
@@ -189,6 +190,7 @@ install_cli = { path = "crates/install_cli" }
 image_viewer = { path = "crates/image_viewer" }
 inline_completion_button = { path = "crates/inline_completion_button" }
 journal = { path = "crates/journal" }
+notebook = { path = "crates/notebook" }
 language = { path = "crates/language" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
