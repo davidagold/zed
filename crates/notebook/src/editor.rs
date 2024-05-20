@@ -1,14 +1,18 @@
 //! Jupyter support for Zed.
 
+use anyhow::{anyhow, Result};
+use assistant::{LanguageModel, LanguageModelRequestMessage};
 use editor::{
-    items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MAX_TAB_TITLE_LEN,
+    items::entry_label_color, scroll::Autoscroll, Editor, EditorEvent, MultiBuffer,
+    MAX_TAB_TITLE_LEN,
 };
 use gpui::{
-    AnyView, AppContext, EventEmitter, FocusHandle, FocusableView, Model, ParentElement,
-    Subscription, View,
+    AnyView, AppContext, AsyncWindowContext, EventEmitter, Flatten, FocusHandle, FocusableView,
+    Model, ModelContext, ParentElement, Subscription, View, WeakView,
 };
 use itertools::Itertools;
 use language::Buffer;
+use log::error;
 use project::{self, Project};
 use rope::{Point, TextSummary};
 use std::{
@@ -24,18 +28,45 @@ use util::paths::PathExt;
 use workspace::item::{ItemEvent, ItemHandle};
 
 use crate::{
-    actions,
-    cell::{Cell, CellBuilder, CellId, CellType},
+    actions::{self},
+    cell::{self, Cell, CellBuilder, CellId, CellType},
+    chat::Chat,
+    common::UpdateInner,
     do_in,
     kernel::KernelEvent,
     Notebook,
 };
 
 pub struct NotebookEditor {
-    notebook: Model<Notebook>,
+    pub(crate) notebook: Model<Notebook>,
     editor: View<Editor>,
     focus_handle: FocusHandle,
+    chat: Chat,
     _subscriptions: Vec<Subscription>,
+}
+
+impl UpdateInner<AsyncWindowContext, Notebook> for WeakView<NotebookEditor> {
+    type InnerContext<'inner, T> = ModelContext<'inner, T>;
+
+    fn update_inner<F, R>(&self, cx: &mut AsyncWindowContext, update: F) -> Result<R>
+    where
+        F: FnOnce(&mut Notebook, &mut ModelContext<'_, Notebook>) -> R,
+    {
+        self.update(cx, |nb_editor, cx| nb_editor.notebook.update(cx, update))
+    }
+}
+
+impl UpdateInner<AsyncWindowContext, MultiBuffer> for WeakView<NotebookEditor> {
+    type InnerContext<'inner, T> = ModelContext<'inner, T>;
+
+    fn update_inner<F, R>(&self, cx: &mut AsyncWindowContext, update: F) -> Result<R>
+    where
+        F: FnOnce(&mut MultiBuffer, &mut ModelContext<'_, MultiBuffer>) -> R,
+    {
+        self.update_inner(cx, |notebook: &mut Notebook, cx| {
+            notebook.cells.multi.update(cx, update)
+        })
+    }
 }
 
 impl NotebookEditor {
@@ -66,24 +97,6 @@ impl NotebookEditor {
         subscriptions.push(cx.subscribe(&project, |_this, _project, event, _cx| {
             log::info!("Event: {:#?}", event);
         }));
-        subscriptions.push(
-            cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
-                cx.emit(event.clone());
-                match event {
-                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {}
-                    EditorEvent::BufferEdited => {
-                        do_in!(|| {
-                            let mut active_cell = this.active_cell(cx)?.clone();
-                            active_cell.update_text_summary(cx);
-                            this.notebook.update(cx, |notebook, cx| {
-                                notebook.cells.tree.insert_or_replace(active_cell, &());
-                            });
-                        });
-                    }
-                    _ => {}
-                }
-            }),
-        );
         if let Some(client_handle) =
             notebook_handle.read_with(cx, |notebook, _cx| notebook.client_handle.clone())
         {
@@ -99,10 +112,17 @@ impl NotebookEditor {
             ));
         };
 
+        let chat = Chat::new(
+            project.downgrade(),
+            LanguageModel::OpenAi(open_ai::Model::FourTurbo),
+            &notebook_handle,
+            cx,
+        );
         NotebookEditor {
             notebook: notebook_handle,
             editor,
             focus_handle,
+            chat: chat,
             _subscriptions: subscriptions,
         }
     }
@@ -122,13 +142,23 @@ impl NotebookEditor {
             let current_cell = self.active_cell(cx)?.clone();
             let next_cell_id = current_cell.id.get().pre_inc();
             self.focus_cell(&next_cell_id, None, cx);
-            self.notebook
-                .read(cx)
-                .client_handle
-                .as_ref()?
-                .read(cx)
-                .run_cell(&current_cell, cx);
-            current_cell.id.get().pre_inc()
+            match current_cell.cell_type {
+                CellType::Code => {
+                    self.notebook
+                        .read(cx)
+                        .client_handle
+                        .as_ref()?
+                        .read(cx)
+                        .run_cell(&current_cell, cx)
+                        .ok()?;
+                }
+                CellType::Chat => {
+                    if let Err(err) = self.next_chat_turn(&current_cell, cx) {
+                        error!("{:#?}", err);
+                    }
+                }
+                _ => {}
+            }
         });
     }
 
@@ -200,7 +230,7 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellAbove,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Left, cx)
+        self.insert_cell(Bias::Left, None, cx);
     }
 
     fn insert_cell_below(
@@ -208,42 +238,49 @@ impl NotebookEditor {
         _cmd: &actions::InsertCellBelow,
         cx: &mut ViewContext<Self>,
     ) -> () {
-        self.insert_cell(Bias::Right, cx)
+        self.insert_cell(Bias::Right, None, cx);
     }
 
-    fn insert_cell(&mut self, bias: Bias, cx: &mut ViewContext<Self>) -> () {
+    fn insert_cell<'cx>(
+        &mut self,
+        bias: Bias,
+        cell_type: Option<CellType>,
+        cx: &'cx mut ViewContext<Self>,
+    ) -> Option<CellId> {
         let Some((_, buffer_handle, _)) = self.editor.read(cx).active_excerpt(cx) else {
-            return ();
+            return None;
         };
+        let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
+            let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
+            Some(current_cell.id.get().clone())
+        })?;
+        let new_cell_id = match bias {
+            Bias::Left => current_cell_id,
+            Bias::Right => current_cell_id.pre_inc(),
+        };
+        let source = cx.new_model(|cx| Buffer::local("\n", cx));
+        let cell = CellBuilder::new(new_cell_id.into())
+            .source(source)
+            .cell_type(cell_type.unwrap_or_default())
+            .build(cx);
 
-        do_in!(|| {
-            let mut current_cell_id = self.notebook.read_with(cx, |notebook, cx| {
-                let current_cell = notebook.cells.get_cell_by_buffer(&buffer_handle, cx)?;
-                Some(current_cell.id.get().clone())
-            })?;
-            let new_cell_id = match bias {
-                Bias::Left => current_cell_id,
-                Bias::Right => current_cell_id.pre_inc(),
-            };
-            let source = cx.new_model(|cx| Buffer::local("", cx));
-            let cell = CellBuilder::new(new_cell_id.clone().into())
-                .source(source)
-                .build(cx);
-            let _ = self.notebook.update(cx, |notebook, cx| {
-                match cell.cell_type {
-                    CellType::Code => {
-                        notebook.try_set_source_languages(cx, Some(vec![&cell]));
-                    }
-                    _ => {}
+        self.notebook.update(cx, |notebook, cx| {
+            match cell.cell_type {
+                CellType::Code => {
+                    notebook.try_set_source_languages(cx, Some(vec![&cell]));
                 }
-                notebook.cells.insert(vec![cell], cx);
-                cx.notify();
-            });
-            self.focus_cell(&new_cell_id, None, cx);
+                _ => {}
+            }
+            notebook.cells.insert(vec![cell], cx);
         });
+        self.focus_cell(&new_cell_id, None, cx);
+        Some(new_cell_id)
     }
 
     fn focus_cell<C: VisualContext>(&mut self, cell_id: &CellId, point: Option<Point>, cx: &mut C) {
+        self.notebook.update(cx, |notebook, cx| {
+            notebook.cells.sync(cx);
+        });
         self.editor.update(cx, |editor, cx| {
             let Some(cell) = self.notebook.read(cx).cells.get_cell_by_id(cell_id).clone() else {
                 return;
@@ -259,6 +296,95 @@ impl NotebookEditor {
                 s.select_ranges([point..point])
             });
         });
+    }
+
+    fn new_chat_cell(&mut self, _cmd: &actions::NewChatCell, cx: &mut ViewContext<Self>) -> () {
+        self.insert_cell(Bias::Right, Some(CellType::Chat), cx);
+    }
+
+    fn next_chat_turn<'cx>(&mut self, cell: &Cell, cx: &mut ViewContext<'cx, Self>) -> Result<()> {
+        let chat = &mut self.chat;
+        let buffer_handle = cx.new_model(|cx| {
+            let buffer = Buffer::local("", cx);
+            let Some(registry) = chat.language_registry.as_ref() else {
+                return buffer;
+            };
+            let markdown = registry.language_for_name("markdown");
+            cx.spawn(|buffer_handle, mut cx| async move {
+                let markdown = markdown.await?;
+                buffer_handle.update(&mut cx, |buffer, cx| {
+                    buffer.set_language(Some(markdown), cx)
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+
+            buffer
+        });
+
+        self.notebook.update(cx, |notebook, cx| {
+            let mut updated = cell.clone();
+            updated.output_content.replace(buffer_handle.clone());
+            updated
+                .state
+                .replace(cell::ExecutionState::Running("".into()));
+            updated.update_titles(cx);
+            notebook.cells.replace(updated, cx);
+        });
+
+        let msg = LanguageModelRequestMessage {
+            role: assistant::Role::User,
+            content: cell.source.read(cx).text(),
+        };
+        chat.messages.push(msg);
+
+        let buffer_id = buffer_handle.read(cx).remote_id();
+        let cell_id = cell.id.get();
+
+        let next_turn = chat.next_turn(cx, move |view, mut delta, cx| {
+            view.update_inner(cx, |multi: &mut MultiBuffer, cx| {
+                let Some(buffer_handle) = multi.buffer(buffer_id) else {
+                    return Err(anyhow!("Failed to obtain buffer handle"));
+                };
+                buffer_handle.update(cx, |buffer, cx| {
+                    // TODO: How do I set `SoftWrap` for a specific excerpt?
+                    let mut offset = buffer.text_summary().len;
+                    let lines = buffer.text_summary().lines;
+                    do_in!(|| {
+                        let no_break_chars = vec![".", ",", "(", ")", "[", "]", "'", "`"];
+                        let can_break = !no_break_chars.iter().contains(&delta.get(0..1)?);
+                        if lines.column + delta.len() as u32 > 96 && can_break {
+                            buffer.edit([(offset..offset, "\n")], None, cx);
+                            if delta.starts_with(" ") {
+                                delta.remove(0);
+                            }
+                            offset += 1;
+                        }
+                    });
+                    buffer.edit([(offset..offset, delta.as_str())], None, cx);
+                    anyhow::Ok(())
+                })
+            })
+            .flatten()
+        });
+
+        cx.spawn(|this, mut cx| async move {
+            let state = match next_turn.await {
+                Ok(_) => cell::ExecutionState::Succeeded("".into()),
+                Err(_err) => cell::ExecutionState::Failed("".into()),
+            };
+            this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
+                do_in!(|| {
+                    let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                    updated.state.replace(state);
+                    updated.update_titles(cx);
+                    notebook.cells.replace(updated, cx);
+                });
+            })
+        })
+        .detach_and_log_err(cx);
+
+        Ok(())
     }
 }
 
@@ -367,10 +493,11 @@ impl Render for NotebookEditor {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.editor.clone())
-            .on_action(cx.listener(NotebookEditor::run_current_cell))
             .on_action(cx.listener(NotebookEditor::insert_cell_above))
             .on_action(cx.listener(NotebookEditor::insert_cell_below))
+            .on_action(cx.listener(NotebookEditor::new_chat_cell))
             .on_action(cx.listener(NotebookEditor::run_current_selection))
+            .on_action(cx.listener(NotebookEditor::run_current_cell))
     }
 }
 
