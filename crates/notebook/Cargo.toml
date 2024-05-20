@@ -30,7 +30,7 @@ pyo3 = { version = "0.21.2", features = ["experimental-async"] }
 regex.workspace = true
 rope.workspace = true
 rpc.workspace = true
-runtimelib = { git = "https://github.com/runtimed/runtimed", version = "0.1.0" }
+runtimelib = { git = "https://github.com/runtimed/runtimed", version = "0.9.0" }
 search.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
