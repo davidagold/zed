@@ -1,8 +1,11 @@
+use std::ops::DerefMut;
+
 use log::error;
 
 use anyhow::anyhow;
 use pyo3::{PyErr, Python};
 use serde::de::DeserializeOwned;
+use ui::Context;
 
 pub(crate) fn parse_value<T: DeserializeOwned, E: serde::de::Error>(
     val: serde_json::Value,
@@ -34,10 +37,7 @@ where
 #[macro_export]
 macro_rules! do_in {
     (|| $body:expr) => {{
-        (|| -> Option<_> {
-            //
-            { $body }.into()
-        })()
+        (|| -> Option<_> { { $body }.into() })()
     }};
 
     (|$py:ident $(:Python)?| $body:expr) => {{
@@ -49,21 +49,26 @@ macro_rules! do_in {
     }};
 
     (|| $body:block) => {{
-        (|| -> Option<_> {
-            //
-            { $body }.into()
-        })()
+        (|| -> Option<_> { { $body }.into() })()
     }};
 
     (|| -> $ret:ty $body:block) => {{
-        (|| -> $ret {
-            //
-            { $body }.into()
-        })()
+        (|| -> $ret { { $body }.into() })()
     }};
 }
 
 pub(crate) fn forward_with_print<T>(err: PyErr) -> anyhow::Result<T> {
     do_in!(|py| err.print(py));
     Err(anyhow!(err))
+}
+
+pub trait UpdateInner<OuterContext: Context, Inner>
+where
+    Self: Sized,
+{
+    type InnerContext<'inner, T>;
+
+    fn update_inner<F, R>(&self, cx: &mut OuterContext, update: F) -> OuterContext::Result<R>
+    where
+        F: FnOnce(&mut Inner, &mut Self::InnerContext<'_, Inner>) -> R;
 }

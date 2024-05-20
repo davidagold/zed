@@ -1,7 +1,5 @@
-use crate::jupyter;
-use crate::jupyter::message::{
-    self, ExecutionState, IoPubSubMessageContent, IoPubSubMessageType, MessageType, MimeData,
-};
+use crate::jupyter::message::{IoPubSubMessageContent, IoPubSubMessageType, MessageType, MimeData};
+use crate::{cell, jupyter};
 use crate::{do_in, jupyter::message::Message};
 use anyhow::{anyhow, Result};
 use collections::HashMap;
@@ -10,7 +8,6 @@ use gpui::{AppContext, AsyncAppContext, Flatten, Model, ModelContext, WeakModel}
 use itertools::Itertools;
 use language::{Buffer, Capability, File};
 use log::error;
-use log::warn;
 use project::Project;
 use rope::{Rope, TextSummary};
 use runtimelib::media::MimeType;
@@ -29,6 +26,7 @@ pub struct Cell {
     pub(crate) latest_execution_request_msg_id: Option<String>,
     pub(crate) text_summary: TextSummary,
     pub(crate) history: HashMap<String, Vec<Message>>,
+    pub(crate) state: Option<ExecutionState>,
 
     // `cell_id` is a notebook field, whereas `cell.id` is the `KeyedItem` associated type  for a `SumTree<Cell>`
     pub cell_id: Option<String>,
@@ -40,41 +38,53 @@ pub struct Cell {
     pub output_content: Option<Model<Buffer>>,
 }
 
+pub(crate) type MessageId = String;
+#[derive(Clone, Debug)]
+pub(crate) enum ExecutionState {
+    Running(MessageId),
+    Succeeded(MessageId),
+    Failed(MessageId),
+}
+
 impl Cell {
-    pub(crate) fn update_titles<C: Context>(&self, mark_success: bool, cx: &mut C) {
-        cx.update_model(&self.source, |buffer, cx| {
-            let title = title_for_cell_excerpt(
-                self.id.get().into(),
-                self.cell_id.as_ref(),
-                &self.cell_type,
-                false,
-                mark_success,
-            );
-            buffer.file_updated(Arc::new(title), cx);
-        });
-        do_in!(
-            || cx.update_model(self.output_content.as_ref()?, |buffer, cx| {
-                let title = title_for_cell_excerpt(
-                    self.id.get().into(),
-                    self.cell_id.as_ref(),
-                    &self.cell_type,
-                    true,
-                    mark_success,
-                );
+    pub(crate) fn update_titles<C: Context>(&self, cx: &mut C) {
+        let cell_id = u64::from(self.id.get());
+
+        let mark = match self.state {
+            Some(ExecutionState::Running(_)) => Some("···"),
+            Some(ExecutionState::Succeeded(_)) => Some("✓"),
+            Some(ExecutionState::Failed(_)) => Some("✗"),
+            None => None,
+        };
+        let mut for_source = vec![
+            format!("({:#?})  ", self.cell_type),
+            format!("Cell {}", cell_id),
+        ];
+        do_in!(|| for_source.insert(1, mark?.into()));
+        let for_output = vec![format!("[Output — Cell {}]", cell_id)];
+
+        for (buffer_handle, title_parts) in
+            self.buffer_handles().iter().zip([for_source, for_output])
+        {
+            let path_buf: PathBuf = title_parts.into_iter().collect();
+            let title = PhonyFile {
+                worktree_id: 0,
+                title: Arc::from(path_buf.as_path()),
+            };
+            cx.update_model(buffer_handle, |buffer, cx| {
                 buffer.file_updated(Arc::new(title), cx);
-            })
-        );
+            });
+        }
     }
 
     fn increment_id<C: Context>(&self, cx: &mut C) -> &Self {
         let incremented_id = self.id.get().pre_inc();
         self.id.set(incremented_id);
-        self.update_titles(false, cx);
+        self.update_titles(cx);
         self
     }
 
     pub(crate) fn update_text_summary<C: Context>(&mut self, cx: &C) {
-        // let mut buffer_handles = vec![&self.source];
         self.source.read_with(cx, |buffer, cx| {
             self.text_summary = buffer.text_snapshot().text_summary();
         });
@@ -115,12 +125,6 @@ pub struct CellBuilder {
     output_content: Option<Model<Buffer>>,
 }
 
-impl Debug for CellBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`cell_id`: {:#?}", self.cell_id)
-    }
-}
-
 impl CellBuilder {
     pub fn new(id: u64) -> CellBuilder {
         CellBuilder {
@@ -131,6 +135,11 @@ impl CellBuilder {
 
     pub fn source(mut self, source: Model<Buffer>) -> Self {
         self.source.replace(source);
+        self
+    }
+
+    pub fn cell_type(mut self, cell_type: CellType) -> Self {
+        self.cell_type.replace(cell_type);
         self
     }
 
@@ -195,38 +204,13 @@ impl CellBuilder {
                             Some([]) => None,
                             Some(outputs) => {
                                 // TODO: Generic over MIME type and other display options
-                                let title = title_for_cell_excerpt(
-                                    self.id.into(),
-                                    self.cell_id.as_ref(),
-                                    self.cell_type.as_ref().unwrap_or(&CellType::Raw),
-                                    true,
-                                    false,
-                                );
-                                OutputHandler::try_as_buffer(outputs.iter(), title, cx)
+                                OutputHandler::try_as_buffer(outputs.iter(), cx)
                             }
                             None => None,
                         };
                     }
                     _ => {}
                 };
-
-                let cell_id = self.cell_id.clone();
-                let cell_type = self.cell_type.clone();
-                do_in!(|| -> Option<_> {
-                    let title = title_for_cell_excerpt(
-                        self.id,
-                        (&cell_id).as_ref(),
-                        &cell_type?,
-                        false,
-                        false,
-                    );
-                    if let Some(buffer_handle) = &self.source {
-                        cx.update_model(&buffer_handle, |buffer, cx| {
-                            buffer.file_updated(Arc::new(title), cx);
-                        })
-                        .ok()?;
-                    };
-                });
 
                 Ok(())
             });
@@ -248,6 +232,7 @@ impl CellBuilder {
         let mut cell = Cell {
             id: CellId(self.id).into(),
             latest_execution_request_msg_id: None,
+            state: None,
             history: HashMap::<String, Vec<Message>>::default(),
             text_summary: self.text_summary.unwrap_or_else(|| TextSummary::from("")),
             cell_id: self.cell_id,
@@ -259,6 +244,7 @@ impl CellBuilder {
             output_content: self.output_content,
         };
         cell.update_text_summary(cx);
+        cell.update_titles(cx);
         cell
     }
 }
@@ -272,6 +258,7 @@ pub enum CellType {
     // https://nbformat.readthedocs.io/en/latest/format_description.html#code-cells
     #[default]
     Code,
+    Chat,
 }
 
 struct CellTypeVisitor();
@@ -359,6 +346,15 @@ pub struct Cells {
 }
 
 impl Cells {
+    pub(crate) fn sync<C: Context>(&mut self, cx: &C) {
+        let updated_cells = self.tree.iter().map(|cell| {
+            let mut updated = cell.clone();
+            updated.update_text_summary(cx);
+            updated
+        });
+        self.tree = SumTree::from_iter(updated_cells, &());
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Cell> {
         self.tree.iter()
     }
@@ -437,13 +433,9 @@ impl Cells {
     ) {
         self.multi.update(cx, |multi, cx| {
             let cells_to_insert = SumTree::<Cell>::from_iter(iterable_cells.into_iter(), &());
-            if cells_to_insert.first().is_none() {
+            let Some(id_first_to_insert) = cells_to_insert.first().map(|cell| cell.id.get()) else {
                 return Err(anyhow!("No cells to insert"));
             };
-            for cell in cells_to_insert.iter() {
-                cell.update_titles(false, cx);
-            }
-            let id_first_to_insert = cells_to_insert.first().unwrap().id.get();
 
             let mut cursor = self.tree.cursor::<CellId>();
             let mut new_tree = cursor.slice(&id_first_to_insert, Bias::Left, &());
@@ -515,21 +507,14 @@ impl Cells {
             _ => cx.new_model(|cx| Buffer::local("", cx)).into(),
         };
 
+        cell.state
+            .replace(cell::ExecutionState::Running(parent_msg_id.clone()));
         match &msg.msg_type {
             MessageType::IoPubSub(io_pubsub_msg_type) => do_in!(|| {
                 use IoPubSubMessageContent::*;
                 use IoPubSubMessageType::*;
 
-                warn!("{:#?}", msg.content);
-                let content = match serde_json::from_value::<IoPubSubMessageContent>(
-                    serde_json::Map::from_iter(msg.content.clone().into_iter()).into(),
-                ) {
-                    Ok(content) => content,
-                    Err(err) => {
-                        error!("{:#?}", err);
-                        return None;
-                    }
-                };
+                let content = msg.content_as::<IoPubSubMessageContent>()?;
 
                 match (io_pubsub_msg_type, &content) {
                     (Stream, IoPubSubMessageContent::Stream { name: _name, text }) => {
@@ -539,22 +524,20 @@ impl Cells {
                             buffer.set_text(extant_text.to_string(), cx);
                         });
                         cell.output_content.replace(buffer_handle);
-                        cell.update_titles(false, cx);
                     }
                     (ExecuteResult, ExecutionResult { data, .. }) => {
                         use MimeType::*;
                         for (mime_type, mime_data) in data {
                             match (mime_type, mime_data) {
                                 (Plain, MimeData::PlainText(text)) => {
-                                    let text = text.to_string();
-                                    buffer_handle
-                                        .update(cx, |buffer, cx| buffer.set_text(text, cx));
+                                    buffer_handle.update(cx, |buffer, cx| {
+                                        buffer.set_text(text.to_string(), cx)
+                                    });
                                 }
                                 _ => {}
                             }
                         }
                         cell.output_content.replace(buffer_handle);
-                        cell.update_titles(false, cx);
                     }
                     (ExecutionError, Error { .. }) => {
                         buffer_handle.update(cx, |buffer, cx| {
@@ -568,9 +551,11 @@ impl Cells {
                             state: jupyter::message::ExecutionState::Idle,
                         },
                     ) => {
-                        if !cell.execution_did_error(&msg.parent_header.msg_id)? {
-                            cell.update_titles(true, cx);
+                        let state = match cell.execution_did_error(&msg.parent_header.msg_id)? {
+                            true => cell::ExecutionState::Failed(parent_msg_id.clone()),
+                            false => cell::ExecutionState::Succeeded(parent_msg_id.clone()),
                         };
+                        cell.state.replace(state);
                     }
                     // TODO: Remaining PubSub message types
                     _ => {}
@@ -582,6 +567,7 @@ impl Cells {
         };
 
         cell.update_text_summary(cx);
+        cell.update_titles(cx);
         self.replace(cell, cx);
         Ok(())
     }
@@ -730,7 +716,7 @@ pub enum IpynbCodeOutput {
 }
 
 // TODO: Appropriate deserialize from string value
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum StreamOutputTarget {
     #[serde(alias = "stdout")]
     Stdout,
@@ -780,7 +766,6 @@ impl OutputHandler {
 
     pub(crate) fn try_as_buffer<'a>(
         outputs: impl Iterator<Item = &'a IpynbCodeOutput>,
-        title: PhonyFile,
         cx: &mut AsyncAppContext,
     ) -> Option<Model<Buffer>> {
         // TODO: For MVP we just handle the `stream` output type, for which it is appropriate
@@ -798,8 +783,7 @@ impl OutputHandler {
             });
 
         cx.new_model(|cx| {
-            let mut buffer = Buffer::local(content.to_string(), cx);
-            buffer.file_updated(Arc::from(title), cx);
+            let buffer = Buffer::local(content.to_string(), cx);
             buffer
         })
         .ok()
@@ -844,8 +828,6 @@ impl TryFrom<&IpynbCodeOutput> for OutputHandler {
 pub(crate) struct PhonyFile {
     worktree_id: usize,
     title: Arc<std::path::Path>,
-    cell_idx: CellId,
-    cell_id: Option<String>,
 }
 
 impl File for PhonyFile {
@@ -891,32 +873,5 @@ impl File for PhonyFile {
 
     fn is_private(&self) -> bool {
         false
-    }
-}
-
-// TODO: Just pass the cell
-pub(crate) fn title_for_cell_excerpt(
-    idx: u64,
-    cell_id: Option<&String>,
-    cell_type: &CellType,
-    for_output: bool,
-    mark_success: bool,
-) -> PhonyFile {
-    let path_iter = match (for_output, mark_success) {
-        (false, true) => vec![
-            format!("({:#?})  ", cell_type),
-            "✓".into(),
-            format!("Cell {idx}"),
-        ]
-        .into_iter(),
-        (false, false) => vec![format!("({:#?})  ", cell_type), format!("Cell {idx}")].into_iter(),
-        (true, _) => vec![format!("[Output — Cell {:#?}]", idx)].into_iter(),
-    };
-    let path_buf: PathBuf = path_iter.collect();
-    PhonyFile {
-        worktree_id: 0,
-        title: Arc::from(path_buf.as_path()),
-        cell_idx: CellId::from(idx),
-        cell_id: cell_id.map(|id| id.clone()),
     }
 }

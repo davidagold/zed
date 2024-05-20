@@ -20,6 +20,15 @@ pub struct Message {
     pub(crate) buffers: Vec<Vec<u8>>,
 }
 
+impl Message {
+    pub fn content_as<T: for<'de> Deserialize<'de>>(&self) -> Option<T> {
+        serde_json::from_value::<T>(
+            serde_json::Map::from_iter(self.content.clone().into_iter()).into(),
+        )
+        .ok()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct MessageHeader {
     pub(crate) msg_id: String,
@@ -142,7 +151,7 @@ pub enum IoPubSubMessageType {
     DebugEvent,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum IoPubSubMessageContent {
     #[serde(alias = "stream")]
@@ -199,7 +208,7 @@ impl IoPubSubMessageContent {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum PlainText {
     Text(String),
@@ -216,7 +225,7 @@ impl ToString for PlainText {
 }
 
 // https://nbformat.readthedocs.io/en/latest/format_description.html#display-data
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum MimeData {
     PlainText(PlainText),
@@ -224,7 +233,7 @@ pub enum MimeData {
     Json(HashMap<String, serde_json::Value>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 pub enum ExecutionState {
     #[serde(alias = "starting")]
     Starting,
