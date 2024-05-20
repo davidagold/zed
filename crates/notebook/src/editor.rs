@@ -376,6 +376,10 @@ impl NotebookEditor {
             this.update_inner(&mut cx, |notebook: &mut Notebook, cx| {
                 do_in!(|| {
                     let mut updated = notebook.cells.get_cell_by_id(&cell_id)?.clone();
+                    updated.output_content.as_ref()?.update(cx, |buffer, cx| {
+                        let offset = buffer.len();
+                        buffer.edit([(offset..offset, "\n")], None, cx);
+                    });
                     updated.state.replace(state);
                     updated.update_titles(cx);
                     notebook.cells.replace(updated, cx);
