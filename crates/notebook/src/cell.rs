@@ -556,6 +556,10 @@ impl Cells {
                             false => cell::ExecutionState::Succeeded(parent_msg_id.clone()),
                         };
                         cell.state.replace(state);
+                        do_in!(|| cell.output_content.as_ref()?.update(cx, |buffer, cx| {
+                            let offset = buffer.len();
+                            buffer.edit([(offset..offset, "\n")], None, cx);
+                        }));
                     }
                     // TODO: Remaining PubSub message types
                     _ => {}
