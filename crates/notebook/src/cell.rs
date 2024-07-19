@@ -13,7 +13,8 @@ use log::error;
 use log::warn;
 use project::Project;
 use rope::{Rope, TextSummary};
-use runtimelib::media::MimeType;
+use runtimelib::MediaType;
+// use runtimelib::media::MimeType;
 use serde::{de::Visitor, Deserialize};
 use serde_json::Value;
 use std::cell::Cell as StdCell;
@@ -542,10 +543,10 @@ impl Cells {
                         cell.update_titles(false, cx);
                     }
                     (ExecuteResult, ExecutionResult { data, .. }) => {
-                        use MimeType::*;
+                        use MediaType::*;
                         for (mime_type, mime_data) in data {
                             match (mime_type, mime_data) {
-                                (Plain, MimeData::PlainText(text)) => {
+                                (Plain(_), MimeData::PlainText(text)) => {
                                     let text = text.to_string();
                                     buffer_handle
                                         .update(cx, |buffer, cx| buffer.set_text(text, cx));
@@ -718,14 +719,14 @@ pub enum IpynbCodeOutput {
     },
     #[serde(alias = "display_data")]
     DisplayData {
-        data: HashMap<MimeType, MimeData>,
-        metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
+        data: HashMap<MediaType, MimeData>,
+        metadata: HashMap<MediaType, HashMap<String, serde_json::Value>>,
     },
     #[serde(alias = "execute_result")]
     ExecutionResult {
         execution_count: usize,
-        data: HashMap<MimeType, MimeData>,
-        metadata: HashMap<MimeType, HashMap<String, serde_json::Value>>,
+        data: HashMap<MediaType, MimeData>,
+        metadata: HashMap<MediaType, HashMap<String, serde_json::Value>>,
     },
 }
 

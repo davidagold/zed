@@ -47,7 +47,7 @@ impl NotebookEditor {
         let multi = notebook_handle.read(cx).cells.multi.clone();
 
         let editor = cx.new_view(|cx| {
-            let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), cx);
+            let mut editor = Editor::for_multibuffer(multi, Some(project.clone()), false, cx);
             editor.set_vertical_scroll_margin(5, cx);
             editor
         });
@@ -323,10 +323,6 @@ impl workspace::item::Item for NotebookEditor {
             .abs_path(cx);
 
         Some(path.compact().to_string_lossy().to_string().into())
-    }
-
-    fn serialized_item_kind() -> Option<&'static str> {
-        Some(NOTEBOOK_KIND)
     }
 
     fn for_each_project_item(
