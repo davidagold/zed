@@ -62,6 +62,7 @@ members = [
     "crates/menu",
     "crates/multi_buffer",
     "crates/node_runtime",
+    "crates/notebook",
     "crates/notifications",
     "crates/ollama",
     "crates/open_ai",
@@ -201,6 +202,7 @@ indexed_docs = { path = "crates/indexed_docs" }
 inline_completion_button = { path = "crates/inline_completion_button" }
 install_cli = { path = "crates/install_cli" }
 journal = { path = "crates/journal" }
+notebook = { path = "crates/notebook" }
 language = { path = "crates/language" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
